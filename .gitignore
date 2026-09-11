@@ -1,23 +1,9 @@
-### AL ###
-#Template for AL projects for Dynamics 365 Business Central
-#launch.json folder
-.vscode/
-#Cache folder
-.alcache/
-#Symbols folder
-.alpackages/
-#Snapshots folder
-.snapshots/
-#Testing Output folder
-.output/
-#Extension App-file
-*.app
-#Rapid Application Development File
-rad.json
-#Translation Base-file
-*.g.xlf
-#License-files
-*.bclicense
-*.flf
-#Test results file
-TestResults.xml
+__pycache__/
+*.py[cod]
+*.db
+memory/long_term.json
+memory/session_context.json
+config/api_keys.json
+.env
+.jarvis_backup/
+.jarvis_update_staging/
