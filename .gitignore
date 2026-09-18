@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Sırlar — ASLA depoya girmez
+config/api_keys.json
+src/jarvis/config/api_keys.json
+config/certs/
+src/jarvis/config/certs/
+*.key
+*.pem
+.env
+
+# Çalışma zamanı verisi (kullanıcıya ait; artık %LOCALAPPDATA%/MuratJARVIS altında)
+logs/
+tasks/
+src/jarvis/memory/*.json
+src/jarvis/memory/*.jsonl
+src/jarvis/memory/*.db
+src/jarvis/memory/quarantine/
+
+# Geliştirici arşivi — dağıtıma girmez
+developer_archive/
+
+# Eski elle alınmış yedekler (bir daha üretilmemeli: sürüm kontrolü git'tir)
+*.bak
+*.bak_*
+*.broken_current_backup
+ui_v4*.py
+ui_v41*.py
+*-1.py
