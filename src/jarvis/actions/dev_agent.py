@@ -586,6 +586,9 @@ _IMPORT_TO_PYPI = {
     "openssl": "pyOpenSSL",
     "win32com": "pywin32",
     "win32api": "pywin32",
+    "crypto": "pycryptodome",
+    "gi": "PyGObject",
+    "opengl": "PyOpenGL",
 }
 
 
