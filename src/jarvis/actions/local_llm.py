@@ -31,12 +31,21 @@ OLLAMA_BASE = "http://localhost:11434"
 # model kurulu olabilir) kurulu olan ILK modele duseriz - hicbir zaman
 # "model yok" diye sessizce basarisiz olmayiz, once GERCEKTEN neyin kurulu
 # oldugunu sorariz.
-# Brain fallback görevleri kısa yanıtlar ister. Büyük coder modeli Windows'ta
-# 30 saniyelik fallback süresini aşabildiği için hızlı yerel modelleri öne al;
-# coder modeli yine son çare olarak korunur.
+# Bu fallback'i kullanan cagiranlarin (self_improve, agent_loop, discovery,
+# entegrasyon) hepsi KOD YAZMA/TEKNIK KARAR gorevleri - rastgele sohbet degil.
+# Kucuk genel-amacli qwen3.5:0.8b hizli ama Turkce dahil pek cok durumda
+# tutarsiz/anlamsiz cevaplar uretiyor (2026-09-21'de elle, dogrudan Ollama
+# API'sine istek atilarak test edildi - bir log dosyasina kaydedilmedi, bu
+# yorum o testin ozeti). Kod-odakli qwen2.5-coder:7b hem dogru kod
+# uretti hem de SOGUK yuklemede bile 30sn butcesinin cok altinda kaldi
+# (Windows + NVIDIA GPU'da olculdu: load_duration ~6.6s, toplam ~9s, ollama ps
+# "100% GPU" gosterdi). Bu yuzden coder modelleri once denenir; kucuk modeller
+# sadece coder modeli hic kurulu degilse devreye girer. NOT: bu olcum GPU'lu
+# bir makinede yapildi - GPU'suz/zayif bir makinede 7B model 30sn'yi asabilir,
+# boyle bir ortamda bu sira tekrar gozden gecirilmeli.
 _PREFERRED_MODELS = (
-    "qwen3.5:0.8b", "qwen3.5:2b", "qwen3.5:4b",
-    "qwen2.5-coder:7b", "qwen2.5-coder", "llama3.1", "llama3",
+    "qwen2.5-coder:7b", "qwen2.5-coder",
+    "qwen3.5:0.8b", "qwen3.5:2b", "qwen3.5:4b", "llama3.1", "llama3",
 )
 
 
