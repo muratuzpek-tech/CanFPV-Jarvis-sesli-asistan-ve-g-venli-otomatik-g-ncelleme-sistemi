@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 import threading
 import time
 import uuid
@@ -47,20 +46,15 @@ from datetime import datetime
 from pathlib import Path
 
 from jarvis.actions.resilience import CircuitBreaker, call_with_resilience
-from jarvis.actions.tools_kopru import ALLOWED_TOOLS, TOOL_DESCRIPTIONS, NotAllowedTool, call_tool, is_destructive
+from jarvis.actions.tools_kopru import (
+    ALLOWED_TOOLS, TOOL_DESCRIPTIONS, NotAllowedTool, call_approved_tool,
+    call_tool, is_destructive,
+)
 from jarvis.paths import memory_dir
 
 
-def _get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = _get_base_dir()
 TASKS_PATH      = memory_dir() / "agent_tasks.json"
 LOG_PATH        = memory_dir() / "agent_loop_log.jsonl"
-API_KEYS_PATH   = BASE_DIR / "config" / "api_keys.json"
 
 MAX_STEPS_PER_TASK = 20     # bir gorev bu kadar adimdan sonra otomatik "failed" sayilir
 DEFAULT_INTERVAL_S = 60.0
@@ -199,6 +193,7 @@ def add_task(goal: str) -> str:
         "goal":       goal,
         "status":     "pending",
         "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
         "history":    [],
         "pending_action": None,
     }
@@ -244,7 +239,7 @@ def approve_task(task_id: str) -> str:
 
         pending = task["pending_action"]
         try:
-            result = call_tool(pending["tool"], pending["parameters"])
+            result = call_approved_tool(pending["tool"], pending["parameters"])
             task["history"].append({
                 "tool": pending["tool"], "parameters": pending["parameters"],
                 "note": pending.get("note", ""), "result": result, "approved": True,
@@ -307,6 +302,26 @@ def cancel_task(task_id: str) -> str:
     return f"'{task_id}' görevi tamamen iptal edildi, bir daha işlenmeyecek."
 
 
+def retry_task(task_id: str) -> str:
+    """Requeue a terminal failed/cancelled task without losing its history."""
+    with _tasks_lock:
+        tasks = _load_tasks()
+        task = _find_task(tasks, task_id)
+        if task is None:
+            return f"'{task_id}' id'li görev bulunamadı."
+        if task.get("status") not in ("failed", "cancelled"):
+            return f"'{task_id}' yeniden denenemez (durum: {task.get('status')})."
+        task["status"] = "pending"
+        task["updated_at"] = datetime.now().isoformat()
+        task["pending_action"] = None
+        task.pop("error", None)
+        task["planning_retries"] = 0
+        task.setdefault("history", []).append({"note": "Kullanıcı görevi yeniden denedi.", "result": "requeued"})
+        _save_tasks(tasks)
+    _log_event({"event": "retried", "task_id": task_id})
+    return f"'{task_id}' görevi yeniden kuyruğa alındı."
+
+
 def _notify_pending_approval(task: dict, tool: str, parameters: dict, note: str) -> None:
     """GUVENLIK NOTU (2026-09-15, YENIDEN UYGULANDI): Bu fonksiyon eskiden
     gercek _call_send_message('whatsapp') ile mesaj gonderiyordu.
@@ -354,6 +369,7 @@ def _run_readonly_github_research(task: dict) -> bool:
 
 def _process_task(task: dict, tasks: list[dict]) -> None:
     task["status"] = "running"
+    task["updated_at"] = datetime.now().isoformat()
     if _run_readonly_github_research(task):
         return
     step_count = len(task.get("history", []))
@@ -366,13 +382,24 @@ def _process_task(task: dict, tasks: list[dict]) -> None:
     try:
         step = _decide_next_step(task)
     except Exception as e:
+        error_text = str(e)
+        quota_error = any(marker in error_text.upper() for marker in ("429", "RESOURCE_EXHAUSTED", "QUOTA EXCEEDED"))
+        if quota_error:
+            task["status"] = "failed"
+            task["error"] = "Gemini API kotası doldu; kota yenilendiğinde görevi yeniden deneyin."
+            task.setdefault("history", []).append({
+                "note": "Planlama kota nedeniyle durduruldu.",
+                "result": f"QUOTA_ERROR: {error_text}",
+            })
+            _log_event({"event": "planning_quota_exhausted", "task_id": task["id"]})
+            return
         retries = int(task.get("planning_retries", 0)) + 1
         task["planning_retries"] = retries
         task.setdefault("history", []).append({
             "note": f"Planlama denemesi {retries}/{MAX_PLANNING_RETRIES} başarısız oldu.",
-            "result": f"PLAN_ERROR: {e}",
+            "result": f"PLAN_ERROR: {error_text}",
         })
-        _log_event({"event": "planning_failed", "task_id": task["id"], "error": str(e)})
+        _log_event({"event": "planning_failed", "task_id": task["id"], "error": error_text})
         if retries >= MAX_PLANNING_RETRIES:
             task["status"] = "failed"
             task["error"] = (
@@ -443,28 +470,16 @@ def _notify_integration_result(result_msg: str) -> None:
 
 
 def _run_discovery_scan(tasks: list[dict]) -> bool:
-    """Downloads'ta yeni bir zip/klasor olup olmadigina bakar (bkz.
-    discovery.py'nin basindaki tasarim notu - kesif+analiz otomatik).
+    """Scan Downloads and turn each accepted candidate into an approval task.
 
-    KULLANICININ ACIK TALIMATIYLA DEGISEN DAVRANIS (onceki surum onay
-    bekliyordu): Gemini 'tool' derse, ARTIK onay BEKLEMEDEN dogrudan
-    actions/entegrasyon.py uzerinden Jarvis'in kendi koduna entegre
-    edilmeye calisilir - kullaniciya "sormadan kendisi entegre etsin"
-    dedikten ve riskin (sozdizimi/import kontrolunun kotu niyetli ama
-    gecerli kodu YAKALAYAMAYACAGI) acikca anlatilmasindan SONRA verilen
-    bilincli bir karardir. Tek kalan guvenlik agi entegrasyon.py'nin
-    kendi standardidir: tam proje yedegi + sozdizimi/import dogrulamasi +
-    basarisiz olursa otomatik geri alma. Sonuc (basarili ya da basarisiz)
-    normal _decide_next_step planlamasindan GECMEZ - dogrudan calisir,
-    kullaniciya SONRADAN (whatsapp bildirimiyle) ne oldugu bildirilir.
-    Herhangi bir hata sessizce loglanir, agent loop'un geri kalanini asla
-    bozmaz."""
+    Discovery is intentionally read/analyze-only.  Integration writes executable
+    code and therefore must remain behind the normal explicit approval path.
+    """
     try:
         from jarvis.actions.discovery import scan_downloads_once
     except Exception as e:
         print(f"[AgentLoop] ⚠️ discovery modülü yüklenemedi: {e}")
         return False
-
     try:
         found = scan_downloads_once()
     except Exception as e:
@@ -473,38 +488,54 @@ def _run_discovery_scan(tasks: list[dict]) -> bool:
 
     changed = False
     for item in found:
-        try:
-            from jarvis.actions.entegrasyon import integrate_discovered_tool
-            result_msg = integrate_discovered_tool(item)
-        except Exception as e:
-            result_msg = f"'{item.get('source_name', 'bilinmeyen')}' entegre edilirken beklenmeyen hata: {e}"
-            print(f"[AgentLoop] ⚠️ {result_msg}")
-
+        source_name = str(item.get("source_name", "bilinmeyen"))
+        parameters = {
+            "name": source_name,
+            "description": item.get("description", ""),
+            "quarantine_path": item.get("quarantine_path", ""),
+        }
         task = {
-            "id":         uuid.uuid4().hex[:8],
-            "goal":       f"Keşfedilen aracı entegre et: {item['source_name']}",
-            "status":     "done",
+            "id": uuid.uuid4().hex[:8],
+            "goal": f"Keşfedilen aracı incele ve kaydet: {source_name}",
+            "status": "awaiting_approval",
             "created_at": datetime.now().isoformat(),
-            "history":    [{"tool": "entegrasyon", "note": item.get("description", ""), "result": result_msg}],
-            "pending_action": None,
+            "history": [{
+                "tool": "discovery_register",
+                "parameters": parameters,
+                "note": item.get("description", ""),
+                "result": "Kullanıcı onayı bekleniyor; otomatik entegrasyon yapılmadı.",
+            }],
+            "pending_action": {
+                "tool": "discovery_register",
+                "parameters": parameters,
+                "note": (
+                    "İndirilen aday karantinada incelendi. Onay verilirse yalnızca "
+                    "kayıt oluşturulur; Jarvis koduna otomatik entegrasyon yapılmaz."
+                ),
+            },
         }
         tasks.append(task)
-        _log_event({"event": "discovery_auto_integrated", "task_id": task["id"],
-                    "source_name": item["source_name"], "result": result_msg})
-        _notify_integration_result(result_msg)
+        _log_event({
+            "event": "discovery_awaiting_approval",
+            "task_id": task["id"],
+            "source_name": source_name,
+        })
+        _notify_pending_approval(
+            task, "discovery_register", parameters, task["pending_action"]["note"]
+        )
         changed = True
-
     return changed
-
 
 def _tick() -> None:
     with _tasks_lock:
         tasks = _load_tasks()
         discovery_changed = _run_discovery_scan(tasks)
-
-        pending = [t for t in tasks if t["status"] == "pending"]
-        if pending:
-            _process_task(pending[0], tasks)
+        # A task becomes running while its planner/tool step is in flight.
+        # Selecting only pending tasks left every such task permanently stuck.
+        active = [t for t in tasks if t.get("status") in ("pending", "running")]
+        if active:
+            active.sort(key=lambda item: str(item.get("created_at", "")))
+            _process_task(active[0], tasks)
             _save_tasks(tasks)
         elif discovery_changed:
             _save_tasks(tasks)
@@ -552,4 +583,6 @@ def agent_loop_tool(parameters: dict = None, player=None) -> str:
     # gider ki model hangisini secerse secsin calissin.
     if action in ("cancel", "remove"):
         return cancel_task(params.get("task_id", ""))
-    return f"Bilinmeyen action: '{action}'. add/list/approve/deny/cancel kullanın."
+    if action == "retry":
+        return retry_task(params.get("task_id", ""))
+    return f"Bilinmeyen action: '{action}'. add/list/approve/deny/cancel/retry kullanın."

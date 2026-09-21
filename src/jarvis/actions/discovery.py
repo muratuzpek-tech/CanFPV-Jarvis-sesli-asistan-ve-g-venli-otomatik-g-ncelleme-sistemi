@@ -224,11 +224,25 @@ def _safe_extract_zip(zip_path: Path, dest: Path) -> None:
     """Zip-slip korumali cikarma - bir zip icindeki '../../etc/passwd' gibi
     yollarin karantina disina cikmasini engeller."""
     dest.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest.resolve()
     with zipfile.ZipFile(zip_path) as zf:
         for member in zf.infolist():
             member_path = (dest / member.filename).resolve()
-            if not str(member_path).startswith(str(dest.resolve())):
-                raise ValueError(f"Güvensiz zip içeriği (zip-slip): {member.filename}")
+            try:
+                member_path.relative_to(dest_resolved)
+            except ValueError:
+                raise ValueError(
+                    f"Güvensiz zip içeriği (zip-slip): {member.filename}"
+                ) from None
+            if member.is_dir():
+                continue
+            # Do not allow a pre-existing destination symlink to redirect writes.
+            parent = member_path.parent
+            if parent != dest_resolved and any(
+                part.is_symlink() for part in [parent, *parent.parents]
+                if part != dest_resolved and dest_resolved in part.parents
+            ):
+                raise ValueError(f"Güvensiz zip hedefi (symlink): {member.filename}")
         zf.extractall(dest)
 
 

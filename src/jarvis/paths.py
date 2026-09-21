@@ -11,7 +11,7 @@ Burada kod dizini (salt okunur) ile veri dizini (yazılabilir) ayrılır.
 
 Veri dizini önceliği:
   1. ``JARVIS_HOME`` ortam değişkeni
-  2. Proje kökünde `memory/` varsa (eski kurulumdan gelen veri) -> geriye dönük uyum
+  2. ``JARVIS_USE_LEGACY_DATA=1`` ile açıkça istenirse proje kökündeki eski veri
   3. Windows: %LOCALAPPDATA%\\MuratJARVIS | macOS: ~/Library/Application Support/MuratJARVIS
      | Linux: $XDG_DATA_HOME/MuratJARVIS (yoksa ~/.local/share/MuratJARVIS)
 """
@@ -58,12 +58,14 @@ def _platform_data_dir() -> Path:
 def data_dir() -> Path:
     env = os.environ.get("JARVIS_HOME", "").strip()
     if env:
-        path = Path(env).expanduser()
-    else:
+        return Path(env).expanduser()
+    if os.environ.get("JARVIS_USE_LEGACY_DATA", "").strip() == "1":
         legacy = project_root() / "memory"
-        path = project_root() if legacy.is_dir() else _platform_data_dir()
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+        if legacy.is_dir():
+            return project_root()
+    # Selecting a location is read-only.  Concrete subdirectory helpers create
+    # storage directories when they are actually used.
+    return _platform_data_dir()
 
 
 def _sub(name: str) -> Path:

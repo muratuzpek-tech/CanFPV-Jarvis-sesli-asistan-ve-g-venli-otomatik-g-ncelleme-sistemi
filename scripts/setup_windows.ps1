@@ -17,9 +17,13 @@ if (-not $pythonVersion) { throw "Python 3.11 veya 3.12 bulunamadi (3.13+ henuz 
 
 if (Test-Path ".venv\Scripts\python.exe") {
     $venvVersion = (& .\.venv\Scripts\python.exe -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
-    if ($venvVersion -ne $pythonVersion) { Remove-Item -Recurse -Force ".venv" }
+    if ($venvVersion -ne $pythonVersion) {
+        throw "Mevcut .venv Python $venvVersion; secilen Python $pythonVersion. .venv silinmedi; elle duzeltin veya baska bir klasor kullanin."
+    }
+} else {
+    & py -$pythonVersion -m venv .venv
+    if ($LASTEXITCODE -ne 0) { throw "Sanal ortam olusturulamadi." }
 }
-if (-not (Test-Path ".venv\Scripts\python.exe")) { & py -$pythonVersion -m venv .venv }
 
 $python = Join-Path $Root ".venv\Scripts\python.exe"
 & $python -m pip install --upgrade pip --no-cache-dir
@@ -34,6 +38,26 @@ if ($LASTEXITCODE -ne 0) { Write-Host "Uyari: Playwright tarayicisi kurulamadi; 
 
 & $python -c "import jarvis, PyQt6, numpy, sounddevice, fastapi; print('import kontrolu OK', jarvis.__version__)"
 if ($LASTEXITCODE -ne 0) { throw "Kurulum dogrulamasi basarisiz oldu." }
+
+# Premium desktop shortcut. pythonw avoids opening an extra console window;
+# the shortcut always points to this extracted folder's own virtualenv.
+$icon = Join-Path $Root "src\jarvis\assets\jarvis_icon_3d.ico"
+$pythonw = Join-Path $Root ".venv\Scripts\pythonw.exe"
+$desktop = [Environment]::GetFolderPath("Desktop")
+if ((Test-Path $icon) -and (Test-Path $pythonw) -and $desktop) {
+    $shortcutPath = Join-Path $desktop "JARVIS AI.lnk"
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $pythonw
+    $shortcut.Arguments = "-m jarvis"
+    $shortcut.WorkingDirectory = $Root
+    $shortcut.IconLocation = "$icon,0"
+    $shortcut.Description = "JARVIS Premium AI Workstation"
+    $shortcut.Save()
+    Write-Host "Masaustu simgesi olusturuldu: $shortcutPath" -ForegroundColor Cyan
+} else {
+    Write-Host "Uyari: Masaustu simgesi olusturulamadi; ikon veya pythonw bulunamadi." -ForegroundColor Yellow
+}
 
 Write-Host "Kurulum tamamlandi." -ForegroundColor Green
 Write-Host 'API anahtari: [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "YENI_ANAHTAR", "User")'

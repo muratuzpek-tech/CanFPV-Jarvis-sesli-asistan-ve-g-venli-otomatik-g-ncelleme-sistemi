@@ -21,6 +21,7 @@ yıkıcı adımları otomatik çalıştırmadan önce kullanıcı onayına sunar
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 from typing import Any
 
 
@@ -191,7 +192,10 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 
 # Yikici sayilan (action, tool) kombinasyonlari - agent_loop bunlari asla
 # dogrudan calistirmaz, once kullaniciya sorar.
-_DESTRUCTIVE_FILE_ACTIONS = {"delete", "move"}
+_DESTRUCTIVE_FILE_ACTIONS = {
+    "create_file", "create_folder", "delete", "delete_all_files",
+    "move", "copy", "rename", "write", "organize_desktop", "extract",
+}
 _DESTRUCTIVE_SETTINGS_ACTIONS = {"shutdown", "restart", "lock_screen", "lock"}
 
 
@@ -225,11 +229,27 @@ def is_destructive(tool: str, parameters: dict) -> bool:
         # yikici DEGILDIR (sadece izole karantinaya indirir/analiz eder) -
         # bu yuzden ayri, YIKICI bir ikinci arac olarak tutuluyor.
         return True
+    if tool in {"backup_rollback", "vault_encrypt", "vault_decrypt"}:
+        return True
     if tool in ALLOWED_TOOLS:
         return False
     # Taninmayan bir arac zaten call_tool() icinde NotAllowedTool ile
     # reddedilecek, ama guvenlik icin burada da varsayilan True donelim.
     return True
+
+
+_APPROVED_TOOL: ContextVar[str | None] = ContextVar("jarvis_approved_tool", default=None)
+
+
+def call_approved_tool(tool: str, parameters: dict) -> str:
+    """Execute a destructive tool only inside the explicit approval path."""
+    if not is_destructive(tool, parameters or {}):
+        return call_tool(tool, parameters)
+    token = _APPROVED_TOOL.set(tool)
+    try:
+        return call_tool(tool, parameters)
+    finally:
+        _APPROVED_TOOL.reset(token)
 
 
 def call_tool(tool: str, parameters: dict) -> str:
@@ -238,4 +258,6 @@ def call_tool(tool: str, parameters: dict) -> str:
     fn = ALLOWED_TOOLS.get(tool)
     if fn is None:
         raise NotAllowedTool(tool)
+    if is_destructive(tool, parameters or {}) and _APPROVED_TOOL.get() != tool:
+        raise PermissionError(f"Araç açık kullanıcı onayı olmadan çalıştırılamaz: {tool}")
     return fn(parameters or {})

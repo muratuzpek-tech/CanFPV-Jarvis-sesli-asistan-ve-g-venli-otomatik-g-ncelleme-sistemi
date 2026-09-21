@@ -57,7 +57,12 @@ from jarvis.actions.automation import task_manager, pop_due_tasks
 from jarvis.actions.pattern_tracker import log_tool_call, detect_patterns
 from jarvis.actions.health_check import health_check
 from jarvis.actions.agent_board import start_parallel_task, check_agent_board
-from jarvis.actions.audio_devices import get_candidates as _audio_candidates, device_name as _audio_device_name
+from jarvis.actions.audio_devices import (
+    device_identity as _audio_device_identity,
+    device_name as _audio_device_name,
+    get_candidates as _audio_candidates,
+    resolve_device_index as _resolve_audio_device,
+)
 from jarvis.actions.resilience import CircuitBreaker
 from jarvis.actions.self_improve import self_improve
 from jarvis.actions.agent_loop import agent_loop_tool, start_background_loop as start_agent_loop
@@ -89,6 +94,19 @@ def _is_github_self_improve_request(text: str) -> bool:
     if "github" not in t:
         return False
     return any(hint in t for hint in _GITHUB_SELF_IMPROVE_HINTS)
+
+
+def _is_generic_task_request(text: str) -> bool:
+    """Detect an explicit Turkish request to add a background task."""
+    t = (text or "").casefold().strip()
+    if not t or any(term in t for term in ("görev durumu", "gorev durumu", "görev listesi", "gorev listesi")):
+        return False
+    has_task = any(term in t for term in ("görev", "gorev"))
+    has_add = any(term in t for term in (
+        "ver", "ekle", "başlat", "baslat", "gönder", "gonder", "oluştur", "olustur",
+        "görev kayd", "gorev kayd", "görev listem", "gorev listem", "görev olarak", "gorev olarak",
+    ))
+    return has_task and has_add
 
 
 def get_base_dir():
@@ -128,11 +146,90 @@ def _load_system_prompt() -> str:
         )
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
+_NON_LATIN_RE = re.compile(
+    r"[\u0370-\u052f\u0590-\u08ff\u0900-\u0dff\u1100-\u11ff\u2e80-\u9fff]"
+)
 
 def _clean_transcript(text: str) -> str:    
     text = _CTRL_RE.sub("", text)
+    text = re.sub(r"\s*(?:<\s*noise\s*>|\[\s*noise\s*\])\s*", " ", text, flags=re.IGNORECASE)
+    # The workstation is configured for Turkish. Live ASR can occasionally
+    # hallucinate a foreign-script fragment from ambient audio; discard that
+    # fragment before it reaches routing or the model response.
+    text = _NON_LATIN_RE.sub(" ", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+
+def _dedupe_response(text: str) -> str:
+    """Collapse a complete response accidentally emitted twice by Live."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) >= 2 and len(sentences) % 2 == 0:
+        midpoint = len(sentences) // 2
+        if sentences[:midpoint] == sentences[midpoint:]:
+            return " ".join(sentences[:midpoint]).strip()
+    if len(text) >= 20 and len(text) % 2 == 0:
+        half = len(text) // 2
+        if text[:half].strip(" .!?\n") == text[half:].strip(" .!?\n"):
+            return text[:half].strip()
+    return text
+
+
+def _response_audio_data(response) -> bytes | None:
+    """Extract inline data without triggering google-genai's warning property."""
+    server_content = (
+        response.get("server_content")
+        if isinstance(response, dict)
+        else getattr(response, "server_content", None)
+    )
+    model_turn = (
+        server_content.get("model_turn")
+        if isinstance(server_content, dict)
+        else getattr(server_content, "model_turn", None)
+    )
+    parts = (
+        model_turn.get("parts")
+        if isinstance(model_turn, dict)
+        else getattr(model_turn, "parts", None)
+    ) or []
+    data_parts: list[bytes] = []
+    for part in parts:
+        inline_data = (
+            part.get("inline_data")
+            if isinstance(part, dict)
+            else getattr(part, "inline_data", None)
+        )
+        data = (
+            inline_data.get("data")
+            if isinstance(inline_data, dict)
+            else getattr(inline_data, "data", None)
+        )
+        if isinstance(data, bytes):
+            data_parts.append(data)
+    return b"".join(data_parts) or None
+
+
+def _close_audio_stream(stream) -> None:
+    """Best-effort stop/close used after task cancellation or open failure."""
+    if stream is None:
+        return
+    for method_name in ("stop", "close"):
+        method = getattr(stream, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+
+
+def _is_auth_error(error_text: str) -> bool:
+    text = (error_text or "").casefold()
+    return any(marker in text for marker in (
+        "api key not valid", "api_key_invalid", "invalid api key",
+        "unauthenticated", "permission_denied", "permission denied",
+        "authentication", "401", "403", "1007",
+    ))
 
 TOOL_DECLARATIONS = [
     {
@@ -873,6 +970,27 @@ class JarvisLive:
                 self.speak(f"[BRAIN_TEAM_STATUS_HATA] {error}")
             return
 
+        # TASK_ADD must precede deterministic system-read shortcuts. Otherwise
+        # a sentence such as "system statusu kontrol et ve sonucu görev
+        # kaydına yaz" is consumed as a direct read and the model may write a
+        # file instead of creating the requested background task.
+        if _is_generic_task_request(text) and not explicit_task_request:
+            try:
+                result = agent_loop_tool(parameters={"action": "add", "goal": text})
+            except Exception as e:
+                result = f"Görev eklenirken hata oluştu: {e}"
+            self.ui.write_log(f"[AGENT_LOOP_EKLENDI] {result}")
+            try:
+                log_turn("jarvis", result)
+            except Exception as e:
+                print(f"[JARVIS] ⚠️ conversation_log (generic task priority): {e}")
+            self.speak(
+                f"[AGENT_LOOP_EKLENDI] Gerçek görev kuyruğu sonucu: {result}. "
+                "Görevin arka planda işleneceğini kısa ve doğal Türkçe ile bildir; "
+                "henüz sonuç uydurma ve dosyaya doğrudan yazma."
+            )
+            return
+
         # SYSTEM_READ -> windows_system -> process_list (Aşama 2 / Adım 1):
         # basit, deterministik bir eşleşme varsa Gemini'nin kendi araç
         # seçimine (system_status vb.) HİÇ bırakmadan doğrudan mevcut
@@ -1068,6 +1186,25 @@ class JarvisLive:
             self.speak(prompt)
             return
 
+        # GENEL TASK_ADD: açıkça görev ekleme istendiğinde Gemini'nin serbest
+        # araç seçimine bırakmadan gerçek Agent Loop kaydını hemen oluştur.
+        if _is_generic_task_request(text) and not explicit_task_request:
+            try:
+                result = agent_loop_tool(parameters={"action": "add", "goal": text})
+            except Exception as e:
+                result = f"Görev eklenirken hata oluştu: {e}"
+            self.ui.write_log(f"[AGENT_LOOP_EKLENDI] {result}")
+            try:
+                log_turn("jarvis", result)
+            except Exception as e:
+                print(f"[JARVIS] ⚠️ conversation_log (generic task): {e}")
+            self.speak(
+                f"[AGENT_LOOP_EKLENDI] Gerçek görev kuyruğu sonucu: {result}. "
+                "Görevin arka planda işleneceğini ve sonucu tamamlanınca bildireceğini "
+                "kısa, doğal Türkçe ile söyle; sonuç uydurma ve görevi ikinci kez ekleme."
+            )
+            return
+
         # bkz. dosyanin basindaki _is_github_self_improve_request notu -
         # modelin arac secimine birakmadan dogrudan agent_loop'a yonlendir.
         if _is_github_self_improve_request(text):
@@ -1171,7 +1308,18 @@ class JarvisLive:
         parts = [time_ctx]
         if mem_str:
             parts.append(mem_str)
+        parts.append(
+            "LANGUAGE GUARD: The user interface language is Turkish. Unless the user "
+            "clearly asks for another language, understand speech and answer only in "
+            "natural Turkish. Never mix Turkish with Russian or another language. "
+            "Ignore ambient noise markers such as <noise>; do not repeat a sentence."
+        )
         parts.append(sys_prompt)
+        parts.append(
+            "FINAL LANGUAGE RULE: Answer this user only in natural Turkish. Do not answer "
+            "in Russian, Telugu, or any other language merely because speech recognition "
+            "produced a foreign-script fragment. Never repeat the same sentence twice."
+        )
 
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -1399,6 +1547,26 @@ class JarvisLive:
 
         import numpy as _np
         _level_state = {"last_print": 0.0}
+        stream_rate = SEND_SAMPLE_RATE
+
+        def _input_rate(device: int) -> int:
+            """Choose a rate the Windows driver accepts; output stays Gemini 16 kHz."""
+            try:
+                sd.check_input_settings(
+                    device=device, samplerate=SEND_SAMPLE_RATE,
+                    channels=CHANNELS, dtype="int16",
+                )
+                return SEND_SAMPLE_RATE
+            except Exception:
+                info = sd.query_devices(device)
+                native = int(round(float(info.get("default_samplerate", 0))))
+                if native <= 0 or native == SEND_SAMPLE_RATE:
+                    raise
+                sd.check_input_settings(
+                    device=device, samplerate=native,
+                    channels=CHANNELS, dtype="int16",
+                )
+                return native
 
         def callback(indata, frames, time_info, status):
             # TESHIS: ses seviyesini periyodik olarak ekrana yazdir - gercek
@@ -1409,6 +1577,10 @@ class JarvisLive:
                 peak = int(_np.abs(indata).max()) if indata.size else 0
                 bar = "█" * min(50, peak // 200)
                 print(f"[JARVIS] 🎚️ Mikrofon seviyesi: {peak:5d} {bar}")
+                try:
+                    self.ui.set_voice_volume(min(1.0, peak / 6000.0))
+                except Exception:
+                    pass
 
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
@@ -1422,9 +1594,19 @@ class JarvisLive:
                 if _peak > 6000:
                     _gain = 3000.0 / _peak
                     _safe = _np.clip(indata.astype(_np.float32) * _gain, -32768, 32767).astype(_np.int16)
+                    samples = _safe
                     data = _safe.tobytes()
                 else:
-                    data = indata.tobytes()
+                    samples = indata
+                if stream_rate != SEND_SAMPLE_RATE:
+                    # Gemini Live expects mono signed-int16 PCM at 16 kHz.
+                    # Windows devices commonly expose only 44.1/48 kHz;
+                    # convert inside the callback instead of rejecting them.
+                    mono = samples[:, 0] if samples.ndim > 1 else samples
+                    out_len = max(1, round(len(mono) * SEND_SAMPLE_RATE / stream_rate))
+                    positions = _np.linspace(0, len(mono) - 1, out_len)
+                    samples = _np.interp(positions, _np.arange(len(mono)), mono).astype(_np.int16)
+                data = samples.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm;rate=16000"}
@@ -1460,18 +1642,28 @@ class JarvisLive:
 
             last_err = None
             opened = False
+            if not candidates:
+                last_err = RuntimeError("no usable input device")
             for cand in candidates:
+                resolved = _resolve_audio_device("input", _audio_device_identity("input", cand))
+                if resolved is None:
+                    last_err = RuntimeError("input device changed or is ambiguous")
+                    print(f"[JARVIS] ⚠️ Mikrofon adayi yeniden dogrulanamadi (device={cand})")
+                    continue
                 try:
+                    stream_rate = _input_rate(resolved)
+                    if stream_rate != SEND_SAMPLE_RATE:
+                        print(f"[JARVIS] ℹ️ Mikrofon {stream_rate} Hz destekliyor; Gemini için 16 kHz'e dönüştürülüyor.")
                     with sd.InputStream(
-                        device=cand,
-                        samplerate=SEND_SAMPLE_RATE,
+                        device=resolved,
+                        samplerate=stream_rate,
                         channels=CHANNELS,
                         dtype="int16",
                         blocksize=CHUNK_SIZE,
                         callback=callback,
                     ):
-                        name = _audio_device_name(cand)
-                        print(f"[JARVIS] 🎤 Mic stream open (device={cand} - {name})")
+                        name = _audio_device_name(resolved)
+                        print(f"[JARVIS] 🎤 Mic stream open (device={resolved} - {name})")
                         _mic_breaker.record_success()
                         opened = True
                         try:
@@ -1480,9 +1672,11 @@ class JarvisLive:
                             pass
                         while True:
                             await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     last_err = e
-                    print(f"[JARVIS] ⚠️ Mikrofon acilamadi (device={cand}): {e}")
+                    print(f"[JARVIS] ⚠️ Mikrofon acilamadi (device={resolved}): {type(e).__name__}")
                     continue
 
             if not opened:
@@ -1505,7 +1699,8 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
-                    if response.data:
+                    _audio_data = _response_audio_data(response)
+                    if _audio_data:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
@@ -1513,7 +1708,6 @@ class JarvisLive:
                                 self._turn_done_event.clear()
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
-                            _audio_data = response.data
                             _SLICE = 2400
                             for _i in range(0, len(_audio_data), _SLICE):
                                 self.audio_in_queue.put_nowait(_audio_data[_i : _i + _SLICE])
@@ -1525,6 +1719,10 @@ class JarvisLive:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
+                                try:
+                                    self.ui.set_voice_transcript(txt)
+                                except Exception:
+                                    pass
 
                         # LIVE_DIAG: Gemini Live response icinden transcript sinyalini izle.
                         try:
@@ -1542,6 +1740,11 @@ class JarvisLive:
                             if txt:
 
                                 in_buf.append(txt)
+                                try:
+                                    self.ui.set_voice_state("USER_SPEAKING", "Canlı ses alınıyor")
+                                    self.ui.set_voice_transcript(txt)
+                                except Exception:
+                                    pass
 
                                 self._last_user_speech = time.monotonic()
 
@@ -1616,7 +1819,7 @@ class JarvisLive:
                                     pass
                             in_buf = []
 
-                            full_out = " ".join(out_buf).strip()
+                            full_out = _dedupe_response(" ".join(out_buf).strip())
                             if full_out:
                                 self.ui.write_log(f"Jarvis: {full_out}")
                                 try:
@@ -1684,83 +1887,105 @@ class JarvisLive:
 
         # Ayni ortak modul (actions/audio_devices.py) - mic ile ayni EXCLUDE
         # listesini ve oncelik sirasini kullanir, health_check.py ile tutarli.
-        out_candidates = _audio_candidates("output")
-        print(f"[JARVIS] Hoparlor adaylari: {out_candidates}")
+        while True:
+            out_candidates = _audio_candidates("output")
+            print(f"[JARVIS] Hoparlor adaylari: {out_candidates}")
+            stream = None
+            last_out_err = None
+            chosen_device = None
+            if _speaker_breaker.is_open():
+                print("[JARVIS] ⏳ Hoparlör devre kesici açık, deneme atlanıyor.")
+            else:
+                for cand in out_candidates:
+                    resolved = _resolve_audio_device("output", _audio_device_identity("output", cand))
+                    if resolved is None:
+                        last_out_err = RuntimeError("output device changed or is ambiguous")
+                        continue
+                    try:
+                        sd.check_output_settings(
+                            device=resolved,
+                            samplerate=RECEIVE_SAMPLE_RATE,
+                            channels=CHANNELS,
+                            dtype="int16",
+                        )
+                        trial = sd.RawOutputStream(
+                            device=resolved,
+                            samplerate=RECEIVE_SAMPLE_RATE,
+                            channels=CHANNELS,
+                            dtype="int16",
+                            blocksize=CHUNK_SIZE,
+                        )
+                        trial.start()
+                        stream = trial
+                        chosen_device = resolved
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        last_out_err = e
+                        print(f"[JARVIS] ⚠️ Hoparlor acilamadi (device={resolved}): {type(e).__name__}")
+                        _close_audio_stream(locals().get("trial"))
+                        continue
 
-        stream = None
-        last_out_err = None
-        chosen_device = None
-        if _speaker_breaker.is_open():
-            print("[JARVIS] ⏳ Hoparlör devre kesici açık, deneme atlanıyor.")
-        else:
-            for cand in out_candidates:
+            if stream is None:
+                _speaker_breaker.record_failure()
+                err_label = type(last_out_err).__name__ if last_out_err else "no_device"
+                print(f"[JARVIS] ❌ Play: kullanilabilir cikis yok ({err_label}); yeniden denenecek")
                 try:
-                    trial = sd.RawOutputStream(
-                        device=cand,
-                        samplerate=RECEIVE_SAMPLE_RATE,
-                        channels=CHANNELS,
-                        dtype="int16",
-                        blocksize=CHUNK_SIZE,
-                    )
-                    trial.start()
-                    stream = trial
-                    chosen_device = cand
-                    break
-                except Exception as e:
-                    last_out_err = e
-                    print(f"[JARVIS] ⚠️ Hoparlor acilamadi (device={cand}): {e}")
-                    continue
+                    self.ui.set_speaker_device(f"YOK ({err_label})")
+                except Exception:
+                    pass
+                await asyncio.sleep(10.0)
+                continue
 
-        if stream is None:
-            _speaker_breaker.record_failure()
-            print(f"[JARVIS] ❌ Play: hicbir cikis cihazi acilamadi ({last_out_err})")
-            raise last_out_err if last_out_err else RuntimeError("Kullanilabilir hoparlör bulunamadı")
+            _speaker_breaker.record_success()
+            name = _audio_device_name(chosen_device)
+            print(f"[JARVIS] 🔊 Hoparlor cihazi: {chosen_device} - {name}")
+            try:
+                self.ui.set_speaker_device(name)
+            except Exception:
+                pass
 
-        _speaker_breaker.record_success()
-        name = _audio_device_name(chosen_device)
-        print(f"[JARVIS] 🔊 Hoparlor cihazi: {chosen_device} - {name}")
-        try:
-            self.ui.set_speaker_device(name)
-        except Exception:
-            pass
+            try:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self.audio_in_queue.get(),
+                            timeout=0.1
+                        )
+                    except TimeoutError:
+                        if (
+                            self._turn_done_event
+                            and self._turn_done_event.is_set()
+                            and self.audio_in_queue.empty()
+                        ):
+                            self.set_speaking(False)
+                            self._turn_done_event.clear()
+                        continue
+                    self.set_speaking(True)
+                    try:
+                        await asyncio.to_thread(stream.write, chunk)
+                        _played_chunks += 1
+                        _last_audio_at = time.monotonic()
+                        if _played_chunks == 1:
+                            print("[AUDIO_DIAG] İlk Gemini ses paketi hoparlör stream'ine yazıldı.")
+                        elif _played_chunks % 200 == 0:
+                            print(f"[AUDIO_DIAG] Hoparlöre yazılan ses paketi: {_played_chunks}")
+                    except asyncio.CancelledError:
+                        raise
+                    except RuntimeError:
+                        return
+                    except Exception as write_error:
+                        print(f"[AUDIO_DIAG] Hoparlöre ses yazılamadı: {type(write_error).__name__}")
+                        _speaker_breaker.record_failure()
+                        break
+            finally:
+                self.set_speaking(False)
+                _close_audio_stream(stream)
 
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        self.audio_in_queue.get(),
-                        timeout=0.1
-                    )
-                except TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                    ):
-                        self.set_speaking(False)
-                        self._turn_done_event.clear()
-                    continue
-                self.set_speaking(True)
-                try:
-                    await asyncio.to_thread(stream.write, chunk)
-                    _played_chunks += 1
-                    _last_audio_at = time.monotonic()
-                    if _played_chunks == 1:
-                        print("[AUDIO_DIAG] İlk Gemini ses paketi hoparlör stream'ine yazıldı.")
-                    elif _played_chunks % 200 == 0:
-                        print(f"[AUDIO_DIAG] Hoparlöre yazılan ses paketi: {_played_chunks}")
-                except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
-                except Exception as write_error:
-                    print(f"[AUDIO_DIAG] Hoparlöre ses yazılamadı: {write_error}")
-                    raise
-        except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
-            raise
-        finally:
-            self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            # A write failure should not tear down Gemini/text mode. Re-enumerate
+            # and try a fresh stream after a short delay.
+            await asyncio.sleep(1.0)
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -2053,22 +2278,25 @@ class JarvisLive:
     async def run(self):
         self._loop = asyncio.get_event_loop()
 
-        # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
-        try:
-            from jarvis.dashboard.server import DashboardServer
-            self._dashboard = DashboardServer()
-            self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
-            # Runs for the whole lifetime, not just inside an active session
-            asyncio.create_task(self._process_dashboard_commands())
-        except Exception as e:
-            print(f"[Dashboard] Disabled: {e}")
+        # Dashboard/phone audio is opt-in. The dashboard module owns its own
+        # firewall policy; this gate prevents importing/starting it by default.
+        if os.environ.get("JARVIS_ENABLE_DASHBOARD", "0").strip() == "1":
+            try:
+                from jarvis.dashboard.server import DashboardServer
+                self._dashboard = DashboardServer()
+                self._dashboard.set_connect_callback(self._on_phone_connected)
+                asyncio.create_task(self._dashboard.serve())
+                asyncio.create_task(self._process_dashboard_commands())
+            except Exception as e:
+                print(f"[Dashboard] Disabled: {type(e).__name__}")
+                self._dashboard = None
+        else:
             self._dashboard = None
 
         while True:
             try:
                 print("[JARVIS] Connecting...")
-                self.ui.set_state("THINKING")
+                self.ui.set_state("CONNECTING")
                 config = self._build_config()
 
                 # Fresh client on every reconnect — avoids stale HTTP session state
@@ -2138,19 +2366,22 @@ class JarvisLive:
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
                 err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
-
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
+                auth_error = _is_auth_error(err_str)
+                # Do not echo exception text or traceback: SDK errors can carry
+                # request metadata. Authentication waits for user correction
+                # instead of retrying a known-invalid key.
+                if auth_error:
+                    print("[JARVIS] Authentication requires user correction.")
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
-                    self.ui.set_state("SLEEPING")
+                    self.ui.set_state("AUTH_REQUIRED")
                     self.ui.prompt_reconfig()
-                    while not self.ui._win._ready:
-                        await asyncio.sleep(1)
-                    print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    win = getattr(self.ui, "_win", None)
+                    while win is not None and not getattr(win, "_ready", False):
+                        await asyncio.sleep(0.5)
+                    self._conn_backoff = 3
                     continue
+
+                print(f"[JARVIS] Error ({type(e).__name__}); reconnect will be delayed.")
 
                 # Network / timeout errors — log clearly and back off
                 is_net_err = any(k in err_str for k in (
