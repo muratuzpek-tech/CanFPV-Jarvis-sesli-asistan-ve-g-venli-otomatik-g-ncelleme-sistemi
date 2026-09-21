@@ -71,7 +71,7 @@ def ollama_generate(prompt: str, timeout: float = 120.0) -> str | None:
         import requests
         resp = requests.post(
             f"{OLLAMA_BASE}/api/generate",
-            json={"model": model, "prompt": prompt, "stream": False},
+            json={"model": model, "prompt": prompt, "stream": False, "think": False},
             timeout=timeout,
         )
         resp.raise_for_status()
