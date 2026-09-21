@@ -398,9 +398,23 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
+                "action":      {"type": "STRING", "description": (
+                    "volume_up | volume_down | mute | unmute | volume_set (use with value=0-100) | "
+                    "brightness_up | brightness_down | sleep_display | pause_video | close_app | "
+                    "close_window | fullscreen | minimize | maximize | snap_left | snap_right | "
+                    "switch_window | show_desktop | task_manager | focus_search | refresh_page | "
+                    "close_tab | new_tab | next_tab | prev_tab | go_back | go_forward | zoom_in | "
+                    "zoom_out | zoom_reset | find_on_page | scroll_up | scroll_down | scroll_top | "
+                    "scroll_bottom | page_up | page_down | copy | paste | cut | undo | redo | "
+                    "select_all | save | enter | escape | screenshot | lock_screen | open_settings | "
+                    "file_explorer | open_run | dark_mode | toggle_wifi | restart | shutdown | "
+                    "type_text (use with value=text) | press_key (use with value=key name) | "
+                    "reload_n (use with value=integer). For volume, ALWAYS use volume_set with an "
+                    "explicit 0-100 value when the user gives a percentage/level; only use "
+                    "volume_up/volume_down for relative 'louder/quieter' requests."
+                )},
                 "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "value":       {"type": "STRING", "description": "Optional value: volume level 0-100 for volume_set, text to type, etc."}
             },
             "required": []
         }
@@ -1445,6 +1459,22 @@ class JarvisLive:
             elif name == "file_controller":
                 r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
                 result = r or "Done."
+                # Mirror listing/info results to the on-screen content panel.
+                # Sesli yanit genelde "listelendi efendim" gibi ozetleyip
+                # gercek dosya adlarini hic soylemiyor - kullanici bunu fark
+                # etti (2026-09-21). Diger arac sonuclari (web_search) icin
+                # zaten yapilan show_content aynasi burada da yapiliyor ki
+                # gercek icerik (dosya adlari) sesli ozetten bagimsiz olarak
+                # gorunur olsun.
+                _fc_action = str(args.get("action", "")).lower()
+                if r and _fc_action in ("list", "find", "largest", "disk_usage", "info"):
+                    _fc_path = args.get("path", "")
+                    _fc_label = f"FILES — {_fc_action.upper()}" + (f" ({_fc_path})" if _fc_path else "")
+                    self.ui.show_content(_fc_label, r)
+                    # Ayrica log/gecmis paneline de yaz - kullanici sadece
+                    # sesli/ozet yaniti degil, ham listeyi de metin olarak
+                    # (kopyalayip yapistirabilecegi transcript'te) gorsun.
+                    self.ui.write_log(f"[{_fc_label}]\n{r}")
 
             elif name == "task_manager":
                 r = await loop.run_in_executor(None, lambda: task_manager(parameters=args, player=self.ui))

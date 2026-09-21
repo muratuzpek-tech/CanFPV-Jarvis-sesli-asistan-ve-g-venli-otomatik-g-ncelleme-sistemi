@@ -642,6 +642,35 @@ def computer_settings(
 
     action = raw_action.lower().strip().replace(" ", "_").replace("-", "_")
 
+    # DUZELTME (kullanici tespit etti, 2026-09-21): Gemini bazen tam eslesen
+    # "volume_set" / "brightness_up" gibi isimler yerine daha genel bir isim
+    # (orn. "volume") uretiyordu; bu isim ACTION_MAP'te YOK ve eskiden direkt
+    # "Unknown action: 'volume'." donup komut sessizce basarisiz oluyordu.
+    # Siklikla gorulen genel isimleri, elde somut bir deger (value) olup
+    # olmamasina gore en makul somut eyleme yonlendiriyoruz.
+    _has_value = value not in (None, "", "null")
+    _GENERIC_ALIASES = {
+        "volume": "volume_set" if _has_value else "volume_up",
+        "sound": "volume_set" if _has_value else "volume_up",
+        "set_volume": "volume_set",
+        "increase_volume": "volume_up",
+        "raise_volume": "volume_up",
+        "louder": "volume_up",
+        "decrease_volume": "volume_down",
+        "lower_volume": "volume_down",
+        "quieter": "volume_down",
+        "brightness": "brightness_up" if not _has_value else "brightness_up",
+        "increase_brightness": "brightness_up",
+        "decrease_brightness": "brightness_down",
+        "lower_brightness": "brightness_down",
+        "close": "close_app",
+        "quit": "close_app",
+        "minimize_window": "minimize",
+        "maximize_window": "maximize",
+    }
+    if action in _GENERIC_ALIASES:
+        action = _GENERIC_ALIASES[action]
+
     if not action:
         return "No action could be determined."
 
