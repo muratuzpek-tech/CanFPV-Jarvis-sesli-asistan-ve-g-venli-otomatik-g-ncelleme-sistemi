@@ -1,8 +1,10 @@
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -19,6 +21,13 @@ PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-flash-latest"
 MODEL_WRITER     = "gemini-flash-latest"
+
+# Onay bekleyen (henuz baslatilmamis) dev_agent istekleri - file_controller.py'deki
+# confirm_code deseniyle ayni mantik: ilk cagri hicbir sey kurmaz/calistirmaz, sadece
+# bir kod doner; kullanici acikca onaylayip ayni kodla tekrar cagirilana kadar pip
+# install / uretilen kodu calistirma adimlarina gecilmez.
+_pending_dev_agent: dict[str, dict] = {}
+
 
 def _get_api_key() -> str:
     from jarvis.core.secure_config import get_gemini_api_key
@@ -398,23 +407,80 @@ def _open_vscode(project_dir: Path) -> bool:
             continue
     return False
 
+# run_command, planlama asamasinda MODELIN URETTIGI bir string - kullanicidan
+# gelmiyor ama yine de kor guvenilmemeli. subprocess shell=False ile calistigi
+# icin pipe/redirect/glob gibi shell metakarakterleri zaten yorumlanmiyor; bu
+# liste, modelin literal argv olarak yikici bir komut ONERMESINE karsi son bir
+# savunma katmani (defense in depth) - "gelistirici modu" degil, mevcut
+# onay-kapili/sabit-workspace tasarimina eklenen ek bir kontrol.
+_DANGEROUS_RUN_PATTERNS = (
+    "rm -rf", "rm -fr", "rm -r -f", "rm -f -r",
+    "chmod -r 777", "chmod 777 -r", "chmod -r 000",
+    "chown -r", "mkfs", "dd if=", "dd of=/dev",
+    ":(){", ":() {",  # fork bomb
+    "sudo ", "su -", "su root",
+    "shutdown", "reboot", "poweroff", "halt",
+    "> /dev/sd", "> /dev/nvme",
+)
+
+
+def _is_dangerous_run_command(run_command: str) -> str | None:
+    low = " ".join(run_command.lower().split())
+    for pattern in _DANGEROUS_RUN_PATTERNS:
+        if pattern in low:
+            return pattern
+    return None
+
+
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
+
+    danger = _is_dangerous_run_command(run_command)
+    if danger:
+        print(f"[DevAgent] 🛑 Reddedildi — yıkıcı komut kalıbı tespit edildi: '{danger}'")
+        return (
+            f"REFUSED: run_command contains a destructive pattern ('{danger}') and was "
+            f"NOT executed. This is not a real failure to fix — do not attempt to work "
+            f"around it, report it to the user as-is."
+        )
+
     try:
         parts = run_command.split()
         if parts[0].lower() == "python":
             parts[0] = sys.executable
 
-        result = subprocess.run(
-            parts,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout,
-            cwd=str(project_dir)
-        )
+        # NOT: cikti dogrudan PIPE'a degil, gercek bir dosyaya yaziliyor ve
+        # surecin sadece KENDI CIKISI (Popen.wait) bekleniyor - subprocess.run(
+        # capture_output=True) KULLANMIYORUZ. SEBEP: Windows'ta bazi antivirus/
+        # EDR yazilimlari (Norton dahil) yeni baslayan process'lere kendi
+        # bilesenini enjekte edip cocuk surecin stdout/stderr PIPE'ina kendi
+        # handle'ini da ekliyor - Python communicate()/capture_output=True
+        # PIPE'in TAMAMEN kapanmasini (TUM handle'lar dahil) bekledigi icin,
+        # enjekte edilen bilesen kendi handle'ini kapatmadikca sure, script
+        # gercekte aninda bitmis olsa bile, TAM timeout suresi kadar "asili"
+        # gorunuyor (2026-09-21'de canli testte gozlemlendi: timeout 30s->90s
+        # yapilinca da SUREKLI tam o surede kesildi - gercek bir hesaplama
+        # degil, bir PIPE kilitlenmesi isareti). Gercek dosyaya yazip sadece
+        # process handle'ini beklemek bu sinifta bir soruna hic girmiyor.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_path = Path(tmp_dir) / "stdout.log"
+            err_path = Path(tmp_dir) / "stderr.log"
+            with open(out_path, "w", encoding="utf-8") as out_f, \
+                 open(err_path, "w", encoding="utf-8") as err_f:
+                proc = subprocess.Popen(
+                    parts,
+                    stdout=out_f, stderr=err_f,
+                    cwd=str(project_dir),
+                )
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
 
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+            stdout = out_path.read_text(encoding="utf-8", errors="replace").strip()
+            stderr = err_path.read_text(encoding="utf-8", errors="replace").strip()
 
         combined_parts = []
         if stdout:
@@ -424,8 +490,6 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
 
         return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
 
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
     except FileNotFoundError as e:
         return f"Command not found: {e}"
     except Exception as e:
@@ -449,6 +513,37 @@ def _try_fix_local_import(error_output: str, project_dir: Path) -> bool:
     return added_any
 
 
+# Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
+# paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
+# yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
+# ozellikle 'sklearn', PyPI'da KASITLI OLARAK bozuk/deprecated bir stub -
+# gercek paket 'scikit-learn'. Bu yuzden bu eslemeyi kontrol etmeden pip'e
+# ham import adini vermek, ayni hatanin sonsuz dongu gibi tekrar tekrar
+# denenmesine yol aciyordu (2026-09-21'de canli dev_agent testinde
+# gozlemlendi: kmeans_clustering projesi 5 denemede de duzelemedi, gercek
+# sebep 'sklearn' paketinin hicbir zaman kurulamamasiydi).
+_IMPORT_TO_PYPI = {
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "cv2": "opencv-python",
+    "pil": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "dotenv": "python-dotenv",
+    "jwt": "PyJWT",
+    "docx": "python-docx",
+    "pptx": "python-pptx",
+    "fitz": "PyMuPDF",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "attr": "attrs",
+    "nmap": "python-nmap",
+    "openssl": "pyOpenSSL",
+    "win32com": "pywin32",
+    "win32api": "pywin32",
+}
+
+
 def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     """ModuleNotFoundError varsa eksik paketi otomatik kurmaya çalışır."""
     pattern = re.compile(
@@ -458,8 +553,9 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     if not match:
         return False
 
-    pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
+    module_name = match.group(1).split(".")[0]
+    pkg = _IMPORT_TO_PYPI.get(module_name.lower(), module_name.replace("_", "-"))
+    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg} (import: {module_name})")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", pkg],
@@ -672,15 +768,53 @@ def _build_project(
 
     _open_vscode(project_dir)
 
-    last_output   = ""
-    auto_installs = 0  
+    last_output      = ""
+    auto_installs    = 0
+    timeout_extended = False
+    current_timeout  = timeout
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
-        last_output = _run_project(run_command, project_dir, timeout)
+        last_output = _run_project(run_command, project_dir, current_timeout)
         log(f"Output preview: {last_output[:150]}")
 
+        if last_output.startswith("REFUSED:"):
+            # Bu bir kod hatasi degil, bir GUVENLIK reddi - self-fix dongusune
+            # asla girmez (model farkli bir yikici komut denemeye kalkabilir).
+            # Dogrudan, durumu oldugu gibi kullaniciya bildirerek durur.
+            msg = (
+                f"'{proj_name}' projesi için üretilen çalıştırma komutu yıkıcı bir "
+                f"kalıp içerdiği için ÇALIŞTIRILMADI (güvenlik reddi), efendim. "
+                f"Dosyalar {project_dir} içinde duruyor, elle kontrol etmeniz gerekiyor."
+            )
+            if speak: speak(msg)
+            return f"{msg}\n\n{last_output}"
+
         if not _has_error(last_output, run_command):
+            if last_output.startswith("Timed out"):
+                # _has_error() timeout'u kasitli olarak hata SAYMIYOR (bir sunucu/
+                # GUI kasitli olarak surekli calisabilir), AMA bu hicbir sey
+                # DOGRULANMADI demektir - antivirus/soguk-import gecikmesi ya da
+                # gercekten takili kalmis bozuk bir betik de ayni ciktiyi verir
+                # (2026-09-21'de canli testte gozlemlendi: Norton 360 taramasi
+                # yuzunden ilk import 30sn'yi asti). Once, henuz kullanilmadiysa,
+                # BIR KEZ uzatilmis timeout ile tekrar denenir - fresh bir pip
+                # install sonrasi soguk import gecikmesini karsilamak icin.
+                if not timeout_extended and attempt < MAX_FIX_ATTEMPTS:
+                    timeout_extended = True
+                    current_timeout = timeout * 3
+                    log(f"Zaman asimi - {current_timeout}s ile bir kez daha deneniyor (soguk import/antivirus taramasi olabilir)...")
+                    time.sleep(1)
+                    continue
+                msg = (
+                    f"'{proj_name}' projesi {current_timeout} saniye içinde tamamlanmadı, efendim. "
+                    f"Bu, kasıtlı olarak sürekli çalışan bir sunucu/GUI uygulaması olabilir — AMA "
+                    f"betiğin gerçekten doğru çalıştığını DOĞRULAYAMADIM, takılı kalmış da olabilir. "
+                    f"Dosyalar {project_dir} içinde duruyor, lütfen VSCode'dan elle kontrol edin."
+                )
+                if speak: speak(msg)
+                return f"{msg}\n\nOutput:\n{last_output}"
+
             msg = (
                 f"Project '{proj_name}' is working, sir. "
                 f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
@@ -749,15 +883,36 @@ def dev_agent(
     language     = p.get("language", "python").strip()
     project_name = p.get("project_name", "").strip()
     timeout      = int(p.get("timeout", 30))
+    confirm_code = (p.get("confirm_code") or "").strip()
 
     if not description:
         return "Please describe the project you want me to build, sir."
 
+    # ONAY KAPISI: bu adim pip ile paket kurar ve modelin urettigi kodu
+    # gercekten calistirir - confirm_code verilmeden hicbiri yapilmaz.
+    if not confirm_code:
+        code = secrets.token_hex(3)
+        _pending_dev_agent[code] = {
+            "description": description, "language": language,
+            "project_name": project_name, "timeout": timeout,
+        }
+        return (
+            f"ONAY GEREKLİ: \"{description}\" açıklamasıyla yeni bir {language} projesi "
+            f"oluşturulacak. Bu adım gerekli paketleri pip ile kurar ve üretilen kodu "
+            f"gerçekten çalıştırır. Kullanıcıya bunu tarif et; kullanıcı SESLİ/YAZILI olarak "
+            f"açıkça onaylarsa (bir sonraki mesajında), dev_agent'ı aynı description/language/"
+            f"project_name ile ve confirm_code='{code}' parametresiyle TEKRAR çağır. "
+            f"Kullanıcı onaylamadan bu kodu kendi kendine kullanma."
+        )
+    pending = _pending_dev_agent.pop(confirm_code, None)
+    if pending is None:
+        return "Onay kodu geçersiz veya süresi dolmuş. Önce confirm_code vermeden çağırıp yeni kod alın."
+
     return _build_project(
-        description  = description,
-        language     = language,
-        project_name = project_name,
-        timeout      = timeout,
+        description  = pending["description"],
+        language     = pending["language"],
+        project_name = pending["project_name"],
+        timeout      = pending["timeout"],
         speak        = speak,
         player       = player,
     )
