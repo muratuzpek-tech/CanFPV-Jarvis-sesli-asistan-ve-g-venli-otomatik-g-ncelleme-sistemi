@@ -76,6 +76,13 @@ recall_conversation: use whenever the user asks what was discussed before — "d
 github_arama: use when the user asks to search/find a project, library or tool on GitHub
   ("github'da X ara", "github'da bununla ilgili bir şey var mı bak"). Read-only — it only
   returns repo name/stars/description/URL, never clones or installs anything.
+discovered_topydo: the user's personal to-do list ("yapılacaklar listeme ekle", "listeme X
+  yaz", "görevlerimi göster/listele", "şu görevi tamamladım/bitirdim", "listeden sil",
+  "listemi temizle"). This is separate from agent_loop's background task queue — use this
+  one only for the user's own personal to-do items, never for background automation steps.
+discovered_jc: low-level utility that converts raw command-line output (ls/ps/df/etc.) into
+  JSON via the 'jc' library. Only call this if the user explicitly hands you command output
+  and asks you to parse/structure it — never use it as a general system-info tool.
 SELF-IMPROVEMENT VIA GITHUB (background, repeating, approval-required): if the user asks
   Jarvis to search GitHub on ITS OWN BEHALF for new capabilities for itself ("kendin için
   github'da daha iyi bir yazılım/araç ara", "kendini geliştirmek için github'ı tara",

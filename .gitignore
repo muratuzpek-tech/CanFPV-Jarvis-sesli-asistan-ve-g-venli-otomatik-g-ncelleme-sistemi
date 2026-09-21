@@ -42,3 +42,4 @@ src/jarvis_yedekler/
 # Self-improve sandbox log ciktilari - klasor yapisini .gitkeep ile koru, icerigi yok say
 src/jarvis/self_improvement/sandbox/logs/*
 !src/jarvis/self_improvement/sandbox/logs/.gitkeep
+venv/

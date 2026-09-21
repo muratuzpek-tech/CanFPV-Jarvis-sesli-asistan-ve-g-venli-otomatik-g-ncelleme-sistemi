@@ -70,6 +70,8 @@ from jarvis.actions.self_improve import self_improve
 from jarvis.actions.agent_loop import agent_loop_tool, start_background_loop as start_agent_loop
 from jarvis.actions.conversation_log import log_turn, recall_conversation
 from jarvis.actions.github_arama import github_search
+from jarvis.actions.discovered_topydo import run as discovered_topydo_run
+from jarvis.actions.discovered_jc import run as discovered_jc_run
 from jarvis.actions.intent_router import match_system_read, match_file_analysis, match_file_modification
 from jarvis.core.secure_config import api_keys_path
 from jarvis.paths import asset
@@ -636,6 +638,47 @@ TOOL_DECLARATIONS = [
                 "max_results": {"type": "INTEGER", "description": "Optional max number of results (default a small handful)."},
             },
             "required": ["query"]
+        }
+    },
+    {
+        "name": "discovered_topydo",
+        "description": (
+            "Simple to-do / task list tool (todo.txt format) — use whenever the user wants to "
+            "add, list, complete, delete, prioritize, or clear items on a personal to-do list, "
+            "e.g. 'yapılacaklar listeme ekle', 'listeme süt al yaz', 'görevlerimi göster', "
+            "'şu görevi tamamladım', 'listemi temizle', 'to-do list', 'add a task'. This is a "
+            "separate, lightweight list from agent_loop's background task queue — use this one "
+            "for the user's own personal to-do items, not for background automation steps."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":   {"type": "STRING", "description": "add|list|done|delete|prioritize|clear (accepts Turkish synonyms like ekle/listele/bitir/sil/oncelik/temizle too)."},
+                "task":     {"type": "STRING", "description": "The task text (for action=add)."},
+                "priority": {"type": "STRING", "description": "Optional priority letter A-Z (for action=add or action=prioritize)."},
+                "task_id":  {"type": "INTEGER", "description": "The item's list number, as shown by action=list (for action=done/delete/prioritize)."},
+                "filter":   {"type": "STRING", "description": "Optional search/filter text (for action=list)."},
+                "all":      {"type": "BOOLEAN", "description": "If true with action=list, also show already-completed items."},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "discovered_jc",
+        "description": (
+            "Converts the plain-text output of a standard command-line tool (e.g. 'ls', 'ps', "
+            "'df', 'ifconfig', 'netstat') into structured JSON, using the open-source 'jc' "
+            "parser library. Use this ONLY if the user explicitly gives you raw command output "
+            "and asks you to parse/structure it into JSON — this is a low-level utility, not a "
+            "general system-info tool (use system_status or windows_system for that instead)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "command": {"type": "STRING", "description": "The name of the command whose output is being parsed, e.g. 'ls', 'ps', 'df' (jc parser name, hyphens allowed)."},
+                "data":    {"type": "STRING", "description": "The raw text output of that command to parse."},
+            },
+            "required": ["command", "data"]
         }
     },
     {
@@ -1497,6 +1540,14 @@ class JarvisLive:
 
             elif name == "github_arama":
                 r = await loop.run_in_executor(None, lambda: github_search(args))
+                result = r or "Done."
+
+            elif name == "discovered_topydo":
+                r = await loop.run_in_executor(None, lambda: discovered_topydo_run(args))
+                result = r or "Done."
+
+            elif name == "discovered_jc":
+                r = await loop.run_in_executor(None, lambda: discovered_jc_run(args))
                 result = r or "Done."
 
             elif name == "web_search":
