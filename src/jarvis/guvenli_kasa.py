@@ -10,9 +10,14 @@ import base64
 import hashlib
 import os
 import struct
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, simpledialog
+except ModuleNotFoundError:
+    tk = None
+    filedialog = messagebox = simpledialog = None
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -70,8 +75,13 @@ def decrypt_file(source: Path, password: str, delete_encrypted: bool = False) ->
     return target
 
 
-class VaultApp(tk.Tk):
+class VaultApp(tk.Tk if tk is not None else object):
     def __init__(self) -> None:
+        if tk is None:
+            raise RuntimeError(
+                "Güvenli kasa GUI'si için sistem Tkinter bileşeni gerekli; "
+                "encrypt_file/decrypt_file işlevleri GUI olmadan kullanılabilir."
+            )
         super().__init__()
         self.title("Jarvis Güvenli Dosya Kasası")
         self.geometry("560x250")
@@ -121,4 +131,7 @@ class VaultApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    VaultApp().mainloop()
+    try:
+        VaultApp().mainloop()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc

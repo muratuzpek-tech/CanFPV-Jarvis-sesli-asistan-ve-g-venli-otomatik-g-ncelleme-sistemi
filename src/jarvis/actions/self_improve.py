@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import secrets
 import subprocess
 import sys
 from datetime import datetime
@@ -54,6 +55,11 @@ LOG_PATH        = memory_dir() / "self_improve_log.jsonl"
 ALLOWED_DIRS        = ("actions", "core", "dashboard")
 ALLOWED_ROOT_FILES  = ("main.py", "ui.py", "jarvis_cli.py")
 NO_IMPORT_CHECK     = {"main", "ui"}  # bunlari import etmek ses/GUI acar - sadece sozdizimi kontrol edilir
+
+# Onay bekleyen (henuz uygulanmamis) self_improve istekleri - file_controller.py'deki
+# confirm_code deseniyle ayni mantik: ilk cagri hicbir seyi degistirmez, sadece bir kod
+# doner; kullanici acikca onaylayip ayni kodla tekrar cagirilana kadar dosyaya dokunulmaz.
+_pending_self_improve: dict[str, dict] = {}
 
 
 def _is_allowed_target(path: Path) -> bool:
@@ -159,11 +165,46 @@ def _get_public_names(source: str) -> set[str]:
     }
 
 
+def _static_analysis_errors(target: Path) -> str | None:
+    """ruff'un Pyflakes ('F') kurallarindan SADECE gercekten calisma-zamani
+    hatasina isaret edenleri (tanimsiz isim, kullanilmadan once referans,
+    fonksiyon disinda return/break/continue vb.) kontrol eder - stil/import-
+    sirasi gibi kozmetik kurallari (E/W) KASITLI OLARAK atlar, cunku onlar
+    'calisir ama guzel degil' demektir ve bu kontrolun gereksiz yere iyi bir
+    degisikligi reddetmesine yol acar.
+
+    Asagidaki GERCEK YASANAN OLAY'daki gibi bir hata (fonksiyon govdesinde
+    kullanilan ama artik var olmayan bir isim) main.py/ui.py icin ozellikle
+    onemli, cunku onlar GUI/ses donanimi actiklari icin import EDILEMEZ ve
+    bugune kadar sadece ast.parse (colpak sozdizimi) ile kontrol ediliyorlardi
+    - yani govde icindeki bir NameError hicbir zaman yakalanamiyordu. ruff
+    kurulu degilse (opsiyonel dev bagimliligi) sessizce atlanir - bu kontrol
+    EK bir guvenlik agidir, olmazsa olmaz degildir ve ana dogrulamayi
+    engellememelidir."""
+    import shutil
+    ruff_path = shutil.which("ruff")
+    if ruff_path is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [ruff_path, "check",
+             "--select=F821,F822,F823,F701,F702,F706", "--quiet", str(target)],
+            capture_output=True, text=True, timeout=15, cwd=str(BASE_DIR),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 and proc.stdout.strip():
+        return proc.stdout.strip()[:600]
+    return None
+
+
 def _verify(target: Path, original: str = "") -> tuple[bool, str]:
     """'Açıkça bozuk mu' testi - bir DOĞRULUK garantisi DEĞİLDİR:
     1) sözdizimi (ast.parse), 2) kamuya açık fonksiyon/sınıfların SİLİNMEDİĞİ
-    (bkz. aşağıdaki GERÇEK YAŞANAN OLAY), 3) main.py/ui.py DIŞINDAKI
-    dosyalar için ayrı bir Python sürecinde gerçek import.
+    (bkz. aşağıdaki GERÇEK YAŞANAN OLAY), 3) statik analiz (ruff, F-kuralları
+    - main.py/ui.py için özellikle önemli, bkz. _static_analysis_errors),
+    4) main.py/ui.py DIŞINDAKI dosyalar için ayrı bir Python sürecinde
+    gerçek import.
 
     GERÇEK YAŞANAN OLAY: yerel Ollama (kota bittiğinde devreye giren
     fallback - bkz. local_llm.py) computer_settings.py'yi 25KB'tan 1.5KB'a
@@ -192,10 +233,14 @@ def _verify(target: Path, original: str = "") -> tuple[bool, str]:
                 f"içe aktarma başarılı olsa bile bu 'iyileştirme' işlevselliği siliyor, reddedildi."
             )
 
+    static_issues = _static_analysis_errors(target)
+    if static_issues:
+        return False, f"Statik analiz (ruff) olası çalışma-zamanı hatası buldu:\n{static_issues}"
+
     rel = target.relative_to(BASE_DIR)
     mod_name = ".".join(rel.with_suffix("").parts)
     if mod_name in NO_IMPORT_CHECK:
-        return True, "ok (sadece sözdizimi kontrol edildi - GUI/ses donanımı açtığı için import edilmedi)"
+        return True, "ok (sözdizimi + statik analiz kontrol edildi - GUI/ses donanımı açtığı için import edilmedi)"
 
     proc = subprocess.run(
         [sys.executable, "-c", f"import {mod_name}"],
@@ -214,6 +259,58 @@ def _log(entry: dict) -> None:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[SelfImprove] ⚠️ Log yazılamadı: {e}")
+
+
+# Yerel bir modeli (örn. Ollama/ms-swift ile fine-tune edilecek) bu görevde
+# eğitmek için veri seti - SADECE doğrulamadan (sözdizimi+ruff+API+import)
+# GERÇEKTEN geçmiş, tutulan degisiklikler buraya yazilir. "query" alani
+# modele TAM OLARAK canli calisirken verilen prompt ile birebir ayni -
+# egitim/gercek kullanim arasinda format farki OLMAMASI icin bilerek boyle.
+TRAINING_DATA_PATH = memory_dir() / "training_examples.jsonl"
+
+
+def _log_training_example(prompt: str, completion: str, rel_str: str, goal: str) -> None:
+    try:
+        TRAINING_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "file": rel_str,
+            "goal": goal,
+            "query": prompt,
+            "response": completion,
+        }
+        with open(TRAINING_DATA_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[SelfImprove] ⚠️ Eğitim verisi yazılamadı: {e}")
+
+
+def _build_prompt(filename: str, goal: str, original: str, error_note: str = "") -> str:
+    """Model prompt'unu tek bir yerden üretir - self_improve()'un canlı akışı
+    VE eğitim verisi tohumlama scripti (seed_training_data.py) AYNI şablonu
+    kullanır, böylece egitim verisi ile gerçek çalışma zamanı isteği arasında
+    format farkı olmaz (bir fine-tune için bu tutarlılık kritik)."""
+    return f"""You are an expert Python engineer improving ONE file inside a working,
+production voice-assistant codebase (a Windows desktop app using PyQt6 and the Gemini Live API).
+
+Goal: {goal}
+
+Rules:
+- Return ONLY the complete updated file content — no explanation, no markdown fences, no commentary.
+- Preserve all existing public function/class names, signatures, and behavior unless the goal
+  explicitly asks to change them.
+- Do not remove functionality.
+- Do NOT add any top-level example/demo/usage code (e.g. a bare `result = some_function(...)`
+  sitting outside any function or `if __name__ == "__main__":` guard) — importing this module
+  must have ZERO side effects. If the ORIGINAL file already had an `if __name__ == "__main__":`
+  block, you may keep it, but never call a function before its own definition in the file.
+- The result MUST be syntactically valid Python and MUST remain importable (no new missing
+  dependencies).{error_note}
+
+Current content of {filename}:
+{original}
+
+Updated content:"""
 
 
 def self_improve(parameters: dict = None, player=None) -> str:
@@ -244,8 +341,31 @@ def self_improve(parameters: dict = None, player=None) -> str:
     if not target.exists():
         return f"Dosya bulunamadı: {target}"
 
+    rel_str = str(target.relative_to(BASE_DIR))
+
+    # ONAY KAPISI: bu cagri gercekten dosyayi degistirmeden ONCE kullanicinin
+    # acik onayini ister - file_controller.delete_all_files/move_file'daki
+    # confirm_code deseniyle ayni. confirm_code verilmemisse hicbir yedek
+    # alinmaz, modele hicbir istek gitmez, dosyaya dokunulmaz.
+    confirm_code = (p.get("confirm_code") or "").strip()
+    if not confirm_code:
+        code = secrets.token_hex(3)
+        _pending_self_improve[code] = {"target": target, "goal": goal}
+        return (
+            f"ONAY GEREKLİ: '{rel_str}' dosyası şu amaçla otomatik olarak değiştirilecek: "
+            f"\"{goal}\". Bu adım dosyanın kaynak kodunu modelin ürettiği yeni içerikle "
+            f"değiştirir (doğrulama başarısız olursa otomatik geri alınır, ama başarılı "
+            f"olursa kalıcıdır). Kullanıcıya bunu tarif et; kullanıcı SESLİ/YAZILI olarak "
+            f"açıkça onaylarsa (bir sonraki mesajında), self_improve'u aynı file_path/goal "
+            f"ile ve confirm_code='{code}' parametresiyle TEKRAR çağır. Kullanıcı onaylamadan "
+            f"bu kodu kendi kendine kullanma."
+        )
+    pending = _pending_self_improve.pop(confirm_code, None)
+    if pending is None or pending["target"] != target:
+        return "Onay kodu geçersiz veya süresi dolmuş. Önce confirm_code vermeden çağırıp yeni kod alın."
+    goal = pending["goal"]
+
     original = target.read_text(encoding="utf-8")
-    rel_str  = str(target.relative_to(BASE_DIR))
 
     from jarvis.backup_tool import JarvisBackupTool
     backup_tool = JarvisBackupTool(BASE_DIR)
@@ -259,27 +379,7 @@ def self_improve(parameters: dict = None, player=None) -> str:
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         error_note = f"\n\nÖnceki deneme bu hatayla doğrulamadan geçemedi, bunu düzelt:\n{last_error}" if last_error else ""
-        prompt = f"""You are an expert Python engineer improving ONE file inside a working,
-production voice-assistant codebase (a Windows desktop app using PyQt6 and the Gemini Live API).
-
-Goal: {goal}
-
-Rules:
-- Return ONLY the complete updated file content — no explanation, no markdown fences, no commentary.
-- Preserve all existing public function/class names, signatures, and behavior unless the goal
-  explicitly asks to change them.
-- Do not remove functionality.
-- Do NOT add any top-level example/demo/usage code (e.g. a bare `result = some_function(...)`
-  sitting outside any function or `if __name__ == "__main__":` guard) — importing this module
-  must have ZERO side effects. If the ORIGINAL file already had an `if __name__ == "__main__":`
-  block, you may keep it, but never call a function before its own definition in the file.
-- The result MUST be syntactically valid Python and MUST remain importable (no new missing
-  dependencies).{error_note}
-
-Current content of {target.name}:
-{original}
-
-Updated content:"""
+        prompt = _build_prompt(target.name, goal, original, error_note)
 
         try:
             response = model.generate_content(prompt)
@@ -299,6 +399,7 @@ Updated content:"""
         if ok:
             _log({"file": rel_str, "goal": goal, "attempt": attempt,
                   "status": "applied", "detail": detail, "backup": str(backup_path)})
+            _log_training_example(prompt, new_content, rel_str, goal)
             msg = (f"'{rel_str}' güncellendi ve doğrulandı ({detail}). Tam proje yedeği: "
                    f"{backup_path.name}. Bir sorun görürsen jarvis_backup_tool.py ile geri "
                    f"alabilirsin.")

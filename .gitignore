@@ -1,37 +1,24 @@
-# Python
+﻿# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
+*.pyc
 .venv/
-.pytest_cache/
-.ruff_cache/
+venv/
+*.egg-info/
 
-# Sırlar — ASLA depoya girmez
-config/api_keys.json
-src/jarvis/config/api_keys.json
-config/certs/
-src/jarvis/config/certs/
-*.key
-*.pem
-.env
+# self_improve otomatik değişiklik-öncesi yedekleri — kaynak kod değil, üretilen veri
+src/jarvis_yedekler/
 
-# Çalışma zamanı verisi (kullanıcıya ait; artık %LOCALAPPDATA%/MuratJARVIS altında)
-logs/
-tasks/
-src/jarvis/memory/*.json
-src/jarvis/memory/*.jsonl
-src/jarvis/memory/*.db
-src/jarvis/memory/quarantine/
-
-# Geliştirici arşivi — dağıtıma girmez
-developer_archive/
-
-# Eski elle alınmış yedekler (bir daha üretilmemeli: sürüm kontrolü git'tir)
-*.bak
+# Elle alınan tek seferlik yedek dosyaları
 *.bak_*
-*.broken_current_backup
-ui_v4*.py
-ui_v41*.py
-*-1.py
+
+# SADECE proje kökündeki kullanıcı verisi (varsa) — src/jarvis/memory/ gibi
+# gerçek kod paketlerini etkilemesin diye başına / koyduk
+/memory/
+/logs/
+/config/api_keys.json
+*.pem
+*.key
+
+# Self-improve sandbox log çıktıları — klasör yapısını .gitkeep ile koru, içeriği yok say
+src/jarvis/self_improvement/sandbox/logs/*
+!src/jarvis/self_improvement/sandbox/logs/.gitkeep

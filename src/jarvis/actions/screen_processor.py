@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import re
 import sys
 import threading
@@ -35,30 +34,32 @@ except ImportError:
 from google import genai
 from google.genai import types as gtypes
 
+from jarvis.core.secure_config import api_keys_path, load_config, save_config
+
+
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
 
-_BASE        = _base_dir()
-_CONFIG_PATH = _BASE / "config" / "api_keys.json"
+# Kept for compatibility with callers that inspect this module constant.  All
+# actual reads/writes below resolve the user path dynamically for JARVIS_HOME.
+_BASE = _base_dir()
+_CONFIG_PATH = api_keys_path(for_write=True)
 
 
 def _load_config() -> dict:
-    try:
-        return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_config()
 
 
 def _save_config_key(key: str, value) -> None:
     try:
-        cfg = _load_config()
-        cfg[key] = value
-        _CONFIG_PATH.write_text(json.dumps(cfg, indent=4), encoding="utf-8")
-    except Exception as e:
-        print(f"[Vision] ⚠️  Could not save config key '{key}': {e}")
+        save_config({key: value})
+    except Exception:
+        # Do not print the exception: configuration paths and malformed input
+        # can contain user-sensitive details.
+        print(f"[Vision] Could not save configuration preference '{key}'.")
 
 
 def _get_api_key() -> str:
@@ -67,7 +68,8 @@ def _get_api_key() -> str:
 
 
 def _get_os() -> str:
-    return _load_config().get("os_system", "windows").lower()
+    value = _load_config().get("os_system", "windows")
+    return value.strip().lower() if isinstance(value, str) and value.strip() else "windows"
 
 _LIVE_MODEL         = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 _CHANNELS           = 1
@@ -165,8 +167,11 @@ def _detect_camera_index() -> int:
 
 def _get_camera_index() -> int:
     cfg = _load_config()
-    if "camera_index" in cfg:
-        return int(cfg["camera_index"])
+    value = cfg.get("camera_index")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if value is not None:
+        print("[Vision] Invalid camera preference; probing available cameras.")
     return _detect_camera_index()
 
 

@@ -1,73 +1,121 @@
-# MuratJARVIS
+# MuratJARVIS 25.1.0
 
-Gemini Live tabanlı, çok beyinli (planner / coder / auditor / research / security / memory / executor)
-sesli masaüstü asistanı. PyQt6 arayüz, yerel dashboard (telefondan uzaktan kumanda), ekran/kamera
-analizi, dosya işlemleri, web araştırması ve kendi kendini geliştirme modülleri içerir.
+Gemini Live tabanlı, PyQt6 arayüzlü çok beyinli bir masaüstü asistanı. Paket;
+sesli oturum, yerel kullanıcı verisi, ekran/kamera araçları ve isteğe bağlı
+yerel dashboard bileşenlerini içerir. **Bu depodaki otomatik kontroller Linux
+üzerinde, donanım ve canlı API kullanılmadan çalışır; gerçek Windows ses/API
+kabulü yapılmış sayılmaz.**
 
 ## Kurulum
 
-Gereken Python: **3.11 veya 3.12** (kod `asyncio.TaskGroup` ve `except*` kullanıyor; 3.13+ doğrulanmadı).
+Desteklenen Python aralığı **3.11 veya 3.12**'dir. Python 3.13 ve üzeri bu
+paket için doğrulanmış değildir.
 
 ### Windows
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
-```
+Depo klasöründeki `KUR_WINDOWS.cmd` dosyasını çalıştırın. Betik kendi klasörüne
+geçer; `py` launcher üzerinden önce Python 3.12'yi, sonra 3.11'i arar ve
+`.venv` yoksa oluşturur. Uyuşmayan mevcut sanal ortamı silmez; durup açık bir
+uyarı verir. Kurulum, yalnızca `.venv` içine editable paket kurar.
+
+Arayüzü backend ve ses başlatmadan görmek için `UI_ONIZLE_WINDOWS.cmd`
+çalıştırılabilir. Normal başlatma `BASLAT_WINDOWS.cmd` ile yapılır. Bu
+betikler yönetici yetkisi istemez, kalıcı PowerShell ExecutionPolicy ayarı
+yapmaz ve kullanıcı yapılandırmasını üzerine yazmaz. PowerShell kurulumu
+kullanılacaksa `scripts/setup_windows.ps1` yalnızca açıkça başlatılan bir
+alternatiftir; gerçek Windows doğrulaması ayrıca yapılmalıdır.
+
+Windows'ta mikrofon için **Settings > Privacy & security > Microphone** altında
+mikrofon erişimini ve masaüstü uygulamalarının erişimini kullanıcı olarak
+kontrol edin. Bu adım sürücü, PortAudio, varsayılan cihaz veya Gemini Live
+sorunlarını otomatik olarak çözmez. Gerçek kayıt yapmadan mikrofonun düzeldiği
+iddia edilmemelidir.
 
 ### Linux / macOS / geliştirme
+
+Aşağıdaki komutlar yalnızca Unix-benzeri geliştirme ortamları içindir:
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
-## API anahtarı
+## API anahtarı ve kullanıcı verisi
 
-Anahtar **koda veya depoya yazılmaz**. Öncelik sırası:
+Anahtar kaynak koduna veya depoya yazılmaz. Okuma önceliği şöyledir:
 
-1. `GEMINI_API_KEY` ortam değişkeni
-2. Kullanıcı veri dizinindeki `config/api_keys.json` (uygulama içindeki kurulum ekranı buraya yazar)
+1. `GEMINI_API_KEY` ortam değişkeni.
+2. `JARVIS_API_KEYS` verilmişse o dosya yolu.
+3. Kullanıcı veri dizinindeki `config/api_keys.json`.
 
-```powershell
-[Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "ANAHTAR", "User")
-```
+İlk açılışta UI anahtarı kullanıcıdan alır ve kullanıcı veri dizinine yazar;
+`--ui-only` yolu sahte anahtar üretmez ve backend'e bağlanmaz. Anahtarı
+paylaşmayın veya örnek dosyaya gerçek değer koymayın. Şema için
+[`docs/api_keys.example.json`](docs/api_keys.example.json) dosyasına bakın.
 
-`docs/api_keys.example.json` örnek şemayı gösterir.
+Kullanıcı verisi platforma göre aşağıdaki dizindedir:
+
+| Platform | Varsayılan veri dizini |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\MuratJARVIS` |
+| macOS | `~/Library/Application Support/MuratJARVIS` |
+| Linux | `$XDG_DATA_HOME/MuratJARVIS` veya `~/.local/share/MuratJARVIS` |
+
+`JARVIS_HOME` verilirse tüm bellek, log, görev, yapılandırma ve sertifika
+alt dizinleri o köke gider. Deneme kurulumunu mevcut kullanıcı verisinden
+ayırmak için Windows'ta geçici bir klasöre `JARVIS_HOME` tanımlayın; test
+bitince bu klasörü kullanıcı kendisi silebilir. Uygulama onay olmadan kullanıcı
+verisini silmez veya toplu dosya işlemi onaylamaz.
 
 ## Çalıştırma
 
+### Windows
+
+`BASLAT_WINDOWS.cmd` dosyasını çalıştırın veya yerel ortam içinden
+`.venv\Scripts\python.exe -m jarvis` komutunu kullanın. Bu yol UI ile
+backend'i birlikte başlatır.
+
+### Linux / macOS
+
 ```bash
-jarvis            # veya:  python -m jarvis
-jarvis-cli        # terminal istemcisi
+jarvis
+# veya
+python -m jarvis
 ```
 
-## Dosyalar nerede?
+Yalnızca arayüz tanılama yolu her platformda `python -m jarvis --ui-only`
+şeklindedir; bu modda Gemini, ses akışı, dashboard ve ana backend başlatılmaz.
+
+UI durum etiketleri bağlantı ve backend sinyallerine göre
+`CONNECTING`, `AUTH_REQUIRED`, `ERROR`, `SLEEPING`, `SPEAKING` ve `LISTENING`
+gibi durumları gösterebilir. Görsel UI'nin açılması tek başına mikrofon,
+Gemini veya cihaz bağlantısının doğrulandığı anlamına gelmez.
+
+## Dosyalar ve güvenlik sınırları
 
 | İçerik | Konum |
 | --- | --- |
-| Kod (salt okunur) | `src/jarvis/` |
-| Kullanıcı verisi | Windows `%LOCALAPPDATA%\MuratJARVIS`, macOS `~/Library/Application Support/MuratJARVIS`, Linux `~/.local/share/MuratJARVIS` |
+| Kod (salt okunur kabul edilir) | `src/jarvis/` |
+| Kullanıcı verisi | `JARVIS_HOME` veya platform varsayılanı |
 | Hafıza / log / görev / sırlar | veri dizini altında `memory/`, `logs/`, `tasks/`, `config/` |
+| Manuel ve canlı kontroller | `tests/manual/` |
 
-Ortam değişkenleri:
+Ortam değişkenleri arasında `JARVIS_HOME`, `JARVIS_API_KEYS`, `JARVIS_FACE` ve
+isteğe bağlı `JARVIS_ALLOW_FIREWALL_SETUP=1` bulunur. Dashboard güvenlik duvarı/UAC
+hazırlığı varsayılan olarak KAPALIDIR; bu adımı etkinleştirmek açık bir kullanıcı
+tercihi (bu değişkeni ayarlamak) gerektirir. Paketleme testleri bu ağ yolunu
+çalıştırmaz.
 
-| Değişken | Etkisi |
-| --- | --- |
-| `JARVIS_HOME` | Tüm kullanıcı verisini verilen dizine taşır |
-| `JARVIS_API_KEYS` | `api_keys.json` için özel yol |
-| `JARVIS_FACE` | HUD'da gösterilecek görsel |
-| `JARVIS_NO_FIREWALL_SETUP=1` | Dashboard'ın Windows güvenlik duvarı/UAC kurulumunu atlar |
+## Test ve doğrulama kapsamı
 
-## Geliştirme
+`pytest` ve `ruff check .` offline otomatik kontroller içindir. Paketleme
+kontrolleri geçici `JARVIS_HOME` kullanır ve gerçek anahtar, ağ, ses, kamera,
+dashboard, firewall veya ana backend başlatmaz. `tests/manual/` altındaki
+betikler otomatik test değildir. Windows işletim sistemi, mikrofon gizlilik
+ayarları, PortAudio sürücüleri, PyQt DPI davranışı, Gemini Live ve gerçek
+cihazlar bu ortamda doğrulanmamıştır.
 
-```bash
-ruff check .                    # lint
-pytest                          # otomatik testler
-pytest tests/manual/...         # canlı API/GUI gerektiren testler (CI'da çalışmaz)
-```
-
-`developer_archive/` yalnızca tarihsel kayıttır (eski yedekler, v25 çalışma verisi, tamamlanmamış
-`openjarvis` ağacı); pakete dahil edilmez ve import edilmez.
-
-Ayrıntılı mimari ve v25'te bulunan sorunların listesi: [`docs/MIMARI.md`](docs/MIMARI.md).
+Ayrıntılı yapı ve doğrulama sınırları için
+[`docs/MIMARI.md`](docs/MIMARI.md) ve [`docs/FINAL_AUDIT_2026-09-18.md`](docs/FINAL_AUDIT_2026-09-18.md)
+dosyalarına bakın.

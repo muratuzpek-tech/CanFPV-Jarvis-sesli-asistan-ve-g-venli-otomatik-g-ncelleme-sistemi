@@ -11,14 +11,17 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import os
 import re
 import secrets
 import socket
 import string
+import tempfile
 import time
 from pathlib import Path
 
 from jarvis.core.secure_config import ensure_self_signed_cert, tls_paths
+from jarvis.paths import data_dir
 
 _DEPS_OK = False
 try:
@@ -44,21 +47,15 @@ MAX_UPLOAD_MB = 500
 
 
 def _make_uploads_dir() -> Path:
-    """Return (and create) the cross-platform uploads folder."""
-    for candidate in [
-        Path.home() / "Downloads" / "JARVIS Uploads",
-        Path.home() / "Documents" / "JARVIS Uploads",
-        BASE_DIR / "uploads",
-    ]:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            return candidate
-        except Exception:
-            pass
-    return BASE_DIR / "uploads"
+    """Return the user-data uploads folder and create it on dashboard start."""
+    candidate = data_dir() / "uploads"
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
 
 
-UPLOADS_DIR = _make_uploads_dir()
+# Kept as a public compatibility constant, but no directory is created at
+# module import.  DashboardServer resolves and creates it when explicitly used.
+UPLOADS_DIR = data_dir() / "uploads"
 
 def _get_gemini_key() -> str | None:
     from jarvis.core.secure_config import get_gemini_api_key
@@ -113,8 +110,10 @@ def _ensure_network_access(port: int) -> None:
     import tempfile
     import threading
 
-    if os.environ.get("JARVIS_NO_FIREWALL_SETUP", "").strip() not in ("", "0"):
-        print("[Dashboard] JARVIS_NO_FIREWALL_SETUP set — skipping firewall/UAC setup.")
+    # Firewall changes and UAC prompts are opt-in.  The old inverse opt-out
+    # switch is intentionally not sufficient because a dashboard start must be
+    # harmless on a fresh machine.
+    if os.environ.get("JARVIS_ALLOW_FIREWALL_SETUP", "").strip() != "1":
         return
 
     # ── Windows ──────────────────────────────────────────────────────────────
@@ -331,7 +330,9 @@ def _ensure_crypto_js() -> None:
         print("[Dashboard] Encryption will fall back to CDN load on client.")
 
 
-_ensure_crypto_js()
+# CryptoJS is already packaged.  Do not download from the network while
+# importing the module; the browser can use the local asset or its documented
+# CDN fallback when explicitly opened by a user.
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -399,7 +400,7 @@ class DashboardServer:
         self._LOGIN_WINDOW_SECS = 60
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
-        self._uploads_dir                 = UPLOADS_DIR
+        self._uploads_dir                 = _make_uploads_dir()
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
         self.app                          = self._build_app()
@@ -510,7 +511,12 @@ class DashboardServer:
                     status_code=429,
                 )
 
-            body    = await req.json()
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Invalid request"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False, "error": "Invalid request"}, status_code=400)
             entered = str(body.get("pin", "")).strip().upper()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 del self._pending_keys[entered]          # one-time use
@@ -588,7 +594,12 @@ class DashboardServer:
                 body = await req.json()
             except Exception:
                 return JSONResponse({"ok": False}, status_code=400)
-            dev_tok = (body.get("device_token") or "").strip()
+            if not isinstance(body, dict):
+                return JSONResponse({"ok": False}, status_code=400)
+            raw_dev_tok = body.get("device_token")
+            if not isinstance(raw_dev_tok, str):
+                return JSONResponse({"ok": False}, status_code=400)
+            dev_tok = raw_dev_tok.strip()
             if not dev_tok or dev_tok not in self._device_sessions:
                 return JSONResponse({"ok": False}, status_code=401)
             session_key = self._device_sessions[dev_tok]["session_key"]
@@ -616,15 +627,25 @@ class DashboardServer:
         async def command(req: Request):
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            body  = await req.json()
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
+            if not isinstance(body, dict):
+                return JSONResponse({"error": "Invalid request"}, status_code=400)
             token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
             enc   = body.get("enc", "")
             if enc:
+                if not isinstance(enc, str):
+                    return JSONResponse({"error": "Invalid request"}, status_code=400)
                 text = self._decrypt(token, enc)
                 if text is None:
                     return JSONResponse({"error": "Decryption failed"}, status_code=400)
             else:
-                text = (body.get("text") or "").strip()
+                raw_text = body.get("text")
+                text = raw_text.strip() if isinstance(raw_text, str) else ""
+            if len(text) > 8192:
+                return JSONResponse({"error": "Command too long"}, status_code=413)
             if text:
                 await self._command_queue.put(text)
                 if self._wake_callback:
@@ -654,6 +675,9 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_bytes()
+                    if len(data) > 256 * 1024:
+                        await websocket.close(code=1009)
+                        break
                     try:
                         self._phone_audio_queue.put_nowait(
                             {"data": data, "mime_type": "audio/pcm"}
@@ -670,9 +694,17 @@ class DashboardServer:
         # ── File sharing ──────────────────────────────────────────────────────
 
         def _safe_filename(raw: str) -> str:
-            name = Path(raw).name                          # strip path components
+            name = Path(str(raw)).name
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
             return name or "upload"
+
+        def _upload_path(name: str) -> Path | None:
+            """Resolve one regular file directly below the upload root."""
+            root = self._uploads_dir.resolve()
+            candidate = (root / name).resolve()
+            if candidate.parent != root or root not in candidate.parents:
+                return None
+            return candidate
 
         if _UPLOAD_OK:
             @app.post("/api/upload")
@@ -681,42 +713,55 @@ class DashboardServer:
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
                 safe = _safe_filename(file.filename or "upload")
-                dest = self._uploads_dir / safe
+                dest = _upload_path(safe)
+                if dest is None:
+                    return JSONResponse({"error": "Invalid file name"}, status_code=400)
                 stem, suffix = Path(safe).stem, Path(safe).suffix
                 counter = 1
-                while dest.exists():
-                    dest = self._uploads_dir / f"{stem}_{counter}{suffix}"
+                while os.path.lexists(dest):
+                    safe = f"{stem}_{counter}{suffix}"
+                    dest = _upload_path(safe)
                     counter += 1
+                    if dest is None:
+                        return JSONResponse({"error": "Invalid file name"}, status_code=400)
 
                 size = 0
                 max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+                tmp_path: Path | None = None
                 try:
-                    with open(dest, "wb") as fout:
+                    fd, tmp_name = tempfile.mkstemp(prefix=".jarvis-upload-", dir=str(self._uploads_dir))
+                    tmp_path = Path(tmp_name)
+                    with os.fdopen(fd, "wb") as fout:
                         while True:
                             chunk = await file.read(65536)
                             if not chunk:
                                 break
                             size += len(chunk)
                             if size > max_bytes:
-                                fout.close()
-                                dest.unlink(missing_ok=True)
                                 return JSONResponse(
                                     {"error": f"File too large (max {MAX_UPLOAD_MB} MB)"},
                                     status_code=413,
                                 )
                             fout.write(chunk)
-                except Exception as exc:
-                    try:
-                        dest.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    return JSONResponse({"error": str(exc)}, status_code=500)
+                        fout.flush()
+                        os.fsync(fout.fileno())
+                    # replace cannot follow a destination symlink; it replaces
+                    # the directory entry, keeping writes inside the root.
+                    os.replace(tmp_path, dest)
+                    tmp_path = None
+                except Exception:
+                    return JSONResponse({"error": "Could not save upload"}, status_code=500)
+                finally:
+                    if tmp_path is not None:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
 
                 asyncio.create_task(self.broadcast({
                     "type": "file_received",
                     "name": dest.name,
                     "size": size,
-                    "saved_to": str(self._uploads_dir),
                 }))
                 return JSONResponse({"ok": True, "name": dest.name, "size": size})
         else:
@@ -733,8 +778,10 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             files = []
             try:
+                root = self._uploads_dir.resolve()
                 for f in sorted(
-                    (p for p in self._uploads_dir.iterdir() if p.is_file()),
+                    (p for p in self._uploads_dir.iterdir()
+                     if p.is_file() and not p.is_symlink() and p.resolve().parent == root),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 ):
@@ -749,9 +796,12 @@ class DashboardServer:
             tok = token.strip()
             if not tok or tok not in self._tokens:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            safe = re.sub(r'[/\\]', '', filename)
-            path = self._uploads_dir / safe
-            if not path.exists() or not path.is_file():
+            safe = _safe_filename(filename)
+            root = self._uploads_dir.resolve()
+            raw_path = root / safe
+            path = raw_path.resolve()
+            if (safe != filename or raw_path.is_symlink() or path.parent != root
+                    or root not in path.parents or not path.is_file()):
                 return JSONResponse({"error": "Not found"}, status_code=404)
             return FileResponse(str(path), filename=safe)
 
@@ -771,13 +821,24 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_json()
-                    if data.get("type") == "command":
-                        enc = data.get("enc", "")
-                        t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
-                        if t:
-                            await self._command_queue.put(t)
-                            if self._wake_callback:
-                                self._wake_callback()
+                    if not isinstance(data, dict) or data.get("type") != "command":
+                        continue
+                    enc = data.get("enc", "")
+                    if enc and not isinstance(enc, str):
+                        continue
+                    raw_text = data.get("text")
+                    if enc:
+                        t = self._decrypt(tok, enc)
+                    elif isinstance(raw_text, str):
+                        t = raw_text.strip()
+                    else:
+                        t = None
+                    if t and len(t) > 8192:
+                        continue
+                    if t:
+                        await self._command_queue.put(t)
+                        if self._wake_callback:
+                            self._wake_callback()
             except WebSocketDisconnect:
                 pass
             finally:
@@ -792,7 +853,8 @@ class DashboardServer:
         Chrome HTTPS-upgrades any bare IP:PORT the user types, so this port also needs TLS.
         User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
         ssl_key, ssl_cert = tls_paths()
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
+        if os.environ.get("JARVIS_ALLOW_FIREWALL_SETUP", "").strip() == "1":
+            asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
@@ -808,7 +870,8 @@ class DashboardServer:
 
         # Firewall setup runs in a thread — uvicorn starts immediately,
         # no waiting for UAC dialogs or subprocess timeouts.
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
+        if os.environ.get("JARVIS_ALLOW_FIREWALL_SETUP", "").strip() == "1":
+            asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
 
         # Özel anahtar artık pakette gelmiyor; ilk çalıştırmada bu makineye
         # özel olarak üretilir (bkz. jarvis.core.secure_config).

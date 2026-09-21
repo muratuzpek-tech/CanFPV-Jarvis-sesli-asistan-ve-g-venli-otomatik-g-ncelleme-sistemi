@@ -17,7 +17,7 @@ import sys
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import ModuleSpec
 
-__version__ = "25.0.0"
+__version__ = "25.1.0"
 
 _LEGACY_TOP = (
     "actions", "brains", "core", "memory", "dashboard",

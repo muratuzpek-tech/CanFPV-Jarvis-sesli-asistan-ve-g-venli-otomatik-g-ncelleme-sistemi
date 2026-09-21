@@ -803,9 +803,12 @@ def extract_archive(path: str, name: str = "", destination: str = "") -> str:
     try:
         dest.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(src) as zf:
+            dest_resolved = dest.resolve()
             for member in zf.infolist():
                 member_path = (dest / member.filename).resolve()
-                if not str(member_path).startswith(str(dest.resolve())):
+                try:
+                    member_path.relative_to(dest_resolved)
+                except ValueError:
                     return f"Güvensiz zip içeriği tespit edildi (zip-slip), açma iptal edildi: {member.filename}"
             zf.extractall(dest)
         return f"Extracted: {src.name} → {dest}"
