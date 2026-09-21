@@ -4,6 +4,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -448,16 +449,38 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
         if parts[0].lower() == "python":
             parts[0] = sys.executable
 
-        result = subprocess.run(
-            parts,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout,
-            cwd=str(project_dir)
-        )
+        # NOT: cikti dogrudan PIPE'a degil, gercek bir dosyaya yaziliyor ve
+        # surecin sadece KENDI CIKISI (Popen.wait) bekleniyor - subprocess.run(
+        # capture_output=True) KULLANMIYORUZ. SEBEP: Windows'ta bazi antivirus/
+        # EDR yazilimlari (Norton dahil) yeni baslayan process'lere kendi
+        # bilesenini enjekte edip cocuk surecin stdout/stderr PIPE'ina kendi
+        # handle'ini da ekliyor - Python communicate()/capture_output=True
+        # PIPE'in TAMAMEN kapanmasini (TUM handle'lar dahil) bekledigi icin,
+        # enjekte edilen bilesen kendi handle'ini kapatmadikca sure, script
+        # gercekte aninda bitmis olsa bile, TAM timeout suresi kadar "asili"
+        # gorunuyor (2026-09-21'de canli testte gozlemlendi: timeout 30s->90s
+        # yapilinca da SUREKLI tam o surede kesildi - gercek bir hesaplama
+        # degil, bir PIPE kilitlenmesi isareti). Gercek dosyaya yazip sadece
+        # process handle'ini beklemek bu sinifta bir soruna hic girmiyor.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out_path = Path(tmp_dir) / "stdout.log"
+            err_path = Path(tmp_dir) / "stderr.log"
+            with open(out_path, "w", encoding="utf-8") as out_f, \
+                 open(err_path, "w", encoding="utf-8") as err_f:
+                proc = subprocess.Popen(
+                    parts,
+                    stdout=out_f, stderr=err_f,
+                    cwd=str(project_dir),
+                )
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
 
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+            stdout = out_path.read_text(encoding="utf-8", errors="replace").strip()
+            stderr = err_path.read_text(encoding="utf-8", errors="replace").strip()
 
         combined_parts = []
         if stdout:
@@ -467,8 +490,6 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
 
         return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
 
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
     except FileNotFoundError as e:
         return f"Command not found: {e}"
     except Exception as e:
