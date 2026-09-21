@@ -492,6 +492,37 @@ def _try_fix_local_import(error_output: str, project_dir: Path) -> bool:
     return added_any
 
 
+# Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
+# paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
+# yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
+# ozellikle 'sklearn', PyPI'da KASITLI OLARAK bozuk/deprecated bir stub -
+# gercek paket 'scikit-learn'. Bu yuzden bu eslemeyi kontrol etmeden pip'e
+# ham import adini vermek, ayni hatanin sonsuz dongu gibi tekrar tekrar
+# denenmesine yol aciyordu (2026-09-21'de canli dev_agent testinde
+# gozlemlendi: kmeans_clustering projesi 5 denemede de duzelemedi, gercek
+# sebep 'sklearn' paketinin hicbir zaman kurulamamasiydi).
+_IMPORT_TO_PYPI = {
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "cv2": "opencv-python",
+    "pil": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "dotenv": "python-dotenv",
+    "jwt": "PyJWT",
+    "docx": "python-docx",
+    "pptx": "python-pptx",
+    "fitz": "PyMuPDF",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "attr": "attrs",
+    "nmap": "python-nmap",
+    "openssl": "pyOpenSSL",
+    "win32com": "pywin32",
+    "win32api": "pywin32",
+}
+
+
 def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     """ModuleNotFoundError varsa eksik paketi otomatik kurmaya çalışır."""
     pattern = re.compile(
@@ -501,8 +532,9 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     if not match:
         return False
 
-    pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
+    module_name = match.group(1).split(".")[0]
+    pkg = _IMPORT_TO_PYPI.get(module_name.lower(), module_name.replace("_", "-"))
+    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg} (import: {module_name})")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", pkg],
