@@ -406,8 +406,43 @@ def _open_vscode(project_dir: Path) -> bool:
             continue
     return False
 
+# run_command, planlama asamasinda MODELIN URETTIGI bir string - kullanicidan
+# gelmiyor ama yine de kor guvenilmemeli. subprocess shell=False ile calistigi
+# icin pipe/redirect/glob gibi shell metakarakterleri zaten yorumlanmiyor; bu
+# liste, modelin literal argv olarak yikici bir komut ONERMESINE karsi son bir
+# savunma katmani (defense in depth) - "gelistirici modu" degil, mevcut
+# onay-kapili/sabit-workspace tasarimina eklenen ek bir kontrol.
+_DANGEROUS_RUN_PATTERNS = (
+    "rm -rf", "rm -fr", "rm -r -f", "rm -f -r",
+    "chmod -r 777", "chmod 777 -r", "chmod -r 000",
+    "chown -r", "mkfs", "dd if=", "dd of=/dev",
+    ":(){", ":() {",  # fork bomb
+    "sudo ", "su -", "su root",
+    "shutdown", "reboot", "poweroff", "halt",
+    "> /dev/sd", "> /dev/nvme",
+)
+
+
+def _is_dangerous_run_command(run_command: str) -> str | None:
+    low = " ".join(run_command.lower().split())
+    for pattern in _DANGEROUS_RUN_PATTERNS:
+        if pattern in low:
+            return pattern
+    return None
+
+
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
+
+    danger = _is_dangerous_run_command(run_command)
+    if danger:
+        print(f"[DevAgent] 🛑 Reddedildi — yıkıcı komut kalıbı tespit edildi: '{danger}'")
+        return (
+            f"REFUSED: run_command contains a destructive pattern ('{danger}') and was "
+            f"NOT executed. This is not a real failure to fix — do not attempt to work "
+            f"around it, report it to the user as-is."
+        )
+
     try:
         parts = run_command.split()
         if parts[0].lower() == "python":
@@ -687,6 +722,18 @@ def _build_project(
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
         last_output = _run_project(run_command, project_dir, timeout)
         log(f"Output preview: {last_output[:150]}")
+
+        if last_output.startswith("REFUSED:"):
+            # Bu bir kod hatasi degil, bir GUVENLIK reddi - self-fix dongusune
+            # asla girmez (model farkli bir yikici komut denemeye kalkabilir).
+            # Dogrudan, durumu oldugu gibi kullaniciya bildirerek durur.
+            msg = (
+                f"'{proj_name}' projesi için üretilen çalıştırma komutu yıkıcı bir "
+                f"kalıp içerdiği için ÇALIŞTIRILMADI (güvenlik reddi), efendim. "
+                f"Dosyalar {project_dir} içinde duruyor, elle kontrol etmeniz gerekiyor."
+            )
+            if speak: speak(msg)
+            return f"{msg}\n\n{last_output}"
 
         if not _has_error(last_output, run_command):
             msg = (
