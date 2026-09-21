@@ -2,6 +2,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -462,9 +463,27 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
         # yapilinca da SUREKLI tam o surede kesildi - gercek bir hesaplama
         # degil, bir PIPE kilitlenmesi isareti). Gercek dosyaya yazip sadece
         # process handle'ini beklemek bu sinifta bir soruna hic girmiyor.
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        #
+        # NOT2: tmp_dir'i "with tempfile.TemporaryDirectory()" YERINE elle
+        # (mkdtemp + finally: rmtree(ignore_errors=True)) yonetiyoruz. SEBEP:
+        # Flask gibi kendi reloader/alt-surecini forklayan programlarda,
+        # timeout'ta sadece dogrudan cocugu (proc.kill()) oldurmek YETMIYOR -
+        # reloader'in baslattigi TORUN surec (gercek sunucu) hayatta kalip log
+        # dosyalarini acik tutmaya devam edebiliyor. Eski kod "with
+        # TemporaryDirectory()" kullaniyordu; bu durumda dizin silinirken
+        # Windows WinError 32 ("dosya baska bir islem tarafindan
+        # kullaniliyor") firlatiyordu ve bu hata "Timed out..." mesajimizi
+        # return ETMEDEN once with-blogundan cikarken olustugu icin asil
+        # mesaji YUTUYOR, disaridaki "except Exception" bunu genel bir "Run
+        # error" gibi gosteriyordu - 5 denemenin 5'i de ayni sekilde basarisiz
+        # oluyordu (2026-09-21, Flask testinde canli gozlemlendi). Simdi: (1)
+        # timeout'ta tum surec agacini olduruyoruz (Windows'ta taskkill /T
+        # /F), (2) temizlik hatasi ASLA asil sonucu maskelemiyor.
+        tmp_dir = tempfile.mkdtemp(prefix="jarvis_devagent_")
+        try:
             out_path = Path(tmp_dir) / "stdout.log"
             err_path = Path(tmp_dir) / "stderr.log"
+            result_text = None
             with open(out_path, "w", encoding="utf-8") as out_f, \
                  open(err_path, "w", encoding="utf-8") as err_f:
                 proc = subprocess.Popen(
@@ -475,25 +494,51 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
                 try:
                     proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
+                    _kill_process_tree(proc)
+                    result_text = f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
+
+            if result_text is not None:
+                return result_text
 
             stdout = out_path.read_text(encoding="utf-8", errors="replace").strip()
             stderr = err_path.read_text(encoding="utf-8", errors="replace").strip()
 
-        combined_parts = []
-        if stdout:
-            combined_parts.append(f"STDOUT:\n{stdout}")
-        if stderr:
-            combined_parts.append(f"STDERR:\n{stderr}")
+            combined_parts = []
+            if stdout:
+                combined_parts.append(f"STDOUT:\n{stdout}")
+            if stderr:
+                combined_parts.append(f"STDERR:\n{stderr}")
 
-        return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
+            return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     except FileNotFoundError as e:
         return f"Command not found: {e}"
     except Exception as e:
         return f"Run error: {e}"
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """proc'un kendisini VE (varsa) torun sureclerini oldurur. Flask'in
+    reloader'i gibi kendi alt-surecini forklayan araclarda proc.kill() TEK
+    BASINA yetmiyor - torun surec hayatta kalip dosya/port acik tutmaya
+    devam edebiliyor. Windows'ta "taskkill /T /F" tum agaci olduruyor;
+    diger platformlarda dogrudan cocugu oldurmek yeterli."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
 
 def _try_fix_local_import(error_output: str, project_dir: Path) -> bool:
     """'No module named X' hatasi, X projenin KENDI klasoru/dosyasiysa,
