@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -19,6 +20,13 @@ PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-flash-latest"
 MODEL_WRITER     = "gemini-flash-latest"
+
+# Onay bekleyen (henuz baslatilmamis) dev_agent istekleri - file_controller.py'deki
+# confirm_code deseniyle ayni mantik: ilk cagri hicbir sey kurmaz/calistirmaz, sadece
+# bir kod doner; kullanici acikca onaylayip ayni kodla tekrar cagirilana kadar pip
+# install / uretilen kodu calistirma adimlarina gecilmez.
+_pending_dev_agent: dict[str, dict] = {}
+
 
 def _get_api_key() -> str:
     from jarvis.core.secure_config import get_gemini_api_key
@@ -749,15 +757,36 @@ def dev_agent(
     language     = p.get("language", "python").strip()
     project_name = p.get("project_name", "").strip()
     timeout      = int(p.get("timeout", 30))
+    confirm_code = (p.get("confirm_code") or "").strip()
 
     if not description:
         return "Please describe the project you want me to build, sir."
 
+    # ONAY KAPISI: bu adim pip ile paket kurar ve modelin urettigi kodu
+    # gercekten calistirir - confirm_code verilmeden hicbiri yapilmaz.
+    if not confirm_code:
+        code = secrets.token_hex(3)
+        _pending_dev_agent[code] = {
+            "description": description, "language": language,
+            "project_name": project_name, "timeout": timeout,
+        }
+        return (
+            f"ONAY GEREKLİ: \"{description}\" açıklamasıyla yeni bir {language} projesi "
+            f"oluşturulacak. Bu adım gerekli paketleri pip ile kurar ve üretilen kodu "
+            f"gerçekten çalıştırır. Kullanıcıya bunu tarif et; kullanıcı SESLİ/YAZILI olarak "
+            f"açıkça onaylarsa (bir sonraki mesajında), dev_agent'ı aynı description/language/"
+            f"project_name ile ve confirm_code='{code}' parametresiyle TEKRAR çağır. "
+            f"Kullanıcı onaylamadan bu kodu kendi kendine kullanma."
+        )
+    pending = _pending_dev_agent.pop(confirm_code, None)
+    if pending is None:
+        return "Onay kodu geçersiz veya süresi dolmuş. Önce confirm_code vermeden çağırıp yeni kod alın."
+
     return _build_project(
-        description  = description,
-        language     = language,
-        project_name = project_name,
-        timeout      = timeout,
+        description  = pending["description"],
+        language     = pending["language"],
+        project_name = pending["project_name"],
+        timeout      = pending["timeout"],
         speak        = speak,
         player       = player,
     )

@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import sys
+import struct
 import traceback
 from urllib.parse import unquote, urlparse
 from datetime import datetime
@@ -61,6 +62,7 @@ from jarvis.actions.audio_devices import (
     device_identity as _audio_device_identity,
     device_name as _audio_device_name,
     get_candidates as _audio_candidates,
+    list_devices as _list_audio_devices,
     resolve_device_index as _resolve_audio_device,
 )
 from jarvis.actions.resilience import CircuitBreaker
@@ -123,6 +125,19 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+
+def _pcm_rms_level(data: bytes, max_expected: float = 9000.0) -> float:
+    """Normalize signed-int16 mono PCM for the Voice Assistant spectrum HUD."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+        return 0.0
+    count = len(data) // 2
+    try:
+        samples = struct.unpack(f"<{count}h", data[:count * 2])
+    except struct.error:
+        return 0.0
+    mean_square = sum(sample * sample for sample in samples) / count
+    return max(0.0, min(1.0, (mean_square ** 0.5) / max_expected))
 
 # Art arda basarisiz mikrofon/hoparlor denemelerinde her reconnect'te tum
 # cihaz listesini bastan taramak yerine kisa bir sure hizlica pes eder
@@ -509,7 +524,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "dev_agent",
-        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors.",
+        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors. The first call (no confirm_code) never installs or runs anything, it only returns a preview and a confirm_code. You MUST relay what will be built to the user and wait for their explicit confirmation in their next message before calling 'dev_agent' again with that confirm_code. Never chain both calls in the same turn without a real user confirmation in between.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -517,6 +532,7 @@ TOOL_DECLARATIONS = [
                 "language":     {"type": "STRING", "description": "Programming language (default: python)"},
                 "project_name": {"type": "STRING", "description": "Optional project folder name"},
                 "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
+                "confirm_code": {"type": "STRING", "description": "The code returned by a PRIOR unconfirmed call, after the user has explicitly confirmed. Leave empty on the first attempt."},
             },
             "required": ["description"]
         }
@@ -530,13 +546,18 @@ TOOL_DECLARATIONS = [
             "before keeping it. If verification fails it retries up to 3 times, then restores the "
             "original file automatically. Use this when the user asks Jarvis to improve/refactor "
             "its own code, fix itself, or 'kendini geliştir'. If no file is named, picks the "
-            "actions/ file that hasn't been reviewed the longest."
+            "actions/ file that hasn't been reviewed the longest. The first call (no confirm_code) "
+            "never touches the file, it only returns a preview and a confirm_code. You MUST relay "
+            "which file and goal to the user and wait for their explicit confirmation in their "
+            "next message before calling 'self_improve' again with that confirm_code. Never chain "
+            "both calls in the same turn without a real user confirmation in between."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "file_path": {"type": "STRING", "description": "Optional path (relative to the project root) of the file to improve, e.g. 'actions/weather_report.py'. If omitted, Jarvis picks one itself."},
-                "goal":      {"type": "STRING", "description": "Optional description of what to improve (e.g. 'add better error handling'). Defaults to a general code-quality pass."},
+                "file_path":    {"type": "STRING", "description": "Optional path (relative to the project root) of the file to improve, e.g. 'actions/weather_report.py'. If omitted, Jarvis picks one itself."},
+                "goal":         {"type": "STRING", "description": "Optional description of what to improve (e.g. 'add better error handling'). Defaults to a general code-quality pass."},
+                "confirm_code": {"type": "STRING", "description": "The code returned by a PRIOR unconfirmed call, after the user has explicitly confirmed. Leave empty on the first attempt."},
             },
             "required": []
         }
@@ -580,13 +601,16 @@ TOOL_DECLARATIONS = [
             "Recalls and summarizes past conversation with the user from a real, persisted "
             "conversation log — use this whenever the user asks what was discussed before, "
             "e.g. 'dün ne konuştuk', 'geçen hafta ne demiştim', 'bunu daha önce konuşmuş "
-            "muyduk', 'what did we talk about yesterday'. Never say you don't have access to "
-            "past conversations without calling this tool first."
+            "muyduk', 'what did we talk about yesterday', OR a recent/same-session reference "
+            "like 'demin ne dedin', '10 dakika önce ne konuşmuştuk', 'az önce söyledin ama' — "
+            "for those, use the 'minutes' parameter instead of 'period'. Never say you don't "
+            "have access to past conversations without calling this tool first."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "period": {"type": "STRING", "description": "bugun | dun | bu_hafta | gecen_hafta — use this for relative time references."},
+                "minutes": {"type": "INTEGER", "description": "Use for recent/same-session references ('demin', 'az önce', 'X dakika önce', 'biraz önce'): how many minutes back to search, e.g. 10. Takes priority over period/date when set."},
+                "period": {"type": "STRING", "description": "bugun | dun | bu_hafta | gecen_hafta — use this for day-level relative time references."},
                 "date":   {"type": "STRING", "description": "Optional explicit date in YYYY-MM-DD format instead of period."},
                 "topic":  {"type": "STRING", "description": "Optional — focus the summary on a specific topic if the user mentioned one."},
             },
@@ -1575,10 +1599,11 @@ class JarvisLive:
             if now - _level_state["last_print"] > 2.0:
                 _level_state["last_print"] = now
                 peak = int(_np.abs(indata).max()) if indata.size else 0
+                rms = float(_np.sqrt(_np.mean(_np.square(indata.astype(_np.float32))))) if indata.size else 0.0
                 bar = "█" * min(50, peak // 200)
                 print(f"[JARVIS] 🎚️ Mikrofon seviyesi: {peak:5d} {bar}")
                 try:
-                    self.ui.set_voice_volume(min(1.0, peak / 6000.0))
+                    self.ui.set_voice_volume(min(1.0, rms / 4500.0))
                 except Exception:
                     pass
 
@@ -1637,7 +1662,13 @@ class JarvisLive:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
 
-            candidates = _audio_candidates("input")
+            # TEK bir anlik goruntu: adaylari bulma + kimlik yakalama + dogrulama
+            # AYNI enumerasyon uzerinden yapilir. Bazi Bluetooth Hands-Free
+            # cihazlari ismini sorgular arasinda tutarsiz raporluyor (bkz.
+            # resolve_device_index docstring'i) - ayri sorgular kullanmak bu
+            # cihazlarda mikrofonun hic acilamamasina yol aciyordu.
+            _devices_snapshot = _list_audio_devices()
+            candidates = _audio_candidates("input", devices=_devices_snapshot)
             print(f"[JARVIS] Mikrofon adaylari: {candidates}")
 
             last_err = None
@@ -1645,7 +1676,11 @@ class JarvisLive:
             if not candidates:
                 last_err = RuntimeError("no usable input device")
             for cand in candidates:
-                resolved = _resolve_audio_device("input", _audio_device_identity("input", cand))
+                resolved = _resolve_audio_device(
+                    "input",
+                    _audio_device_identity("input", cand, devices=_devices_snapshot),
+                    devices=_devices_snapshot,
+                )
                 if resolved is None:
                     last_err = RuntimeError("input device changed or is ambiguous")
                     print(f"[JARVIS] ⚠️ Mikrofon adayi yeniden dogrulanamadi (device={cand})")
@@ -1662,7 +1697,7 @@ class JarvisLive:
                         blocksize=CHUNK_SIZE,
                         callback=callback,
                     ):
-                        name = _audio_device_name(resolved)
+                        name = _audio_device_name(resolved, devices=_devices_snapshot)
                         print(f"[JARVIS] 🎤 Mic stream open (device={resolved} - {name})")
                         _mic_breaker.record_success()
                         opened = True
@@ -1888,7 +1923,10 @@ class JarvisLive:
         # Ayni ortak modul (actions/audio_devices.py) - mic ile ayni EXCLUDE
         # listesini ve oncelik sirasini kullanir, health_check.py ile tutarli.
         while True:
-            out_candidates = _audio_candidates("output")
+            # Ayni "tek anlik goruntu" duzeltmesi mikrofon icin de gecerli -
+            # bkz. yukarisi ve resolve_device_index docstring'i.
+            _devices_snapshot = _list_audio_devices()
+            out_candidates = _audio_candidates("output", devices=_devices_snapshot)
             print(f"[JARVIS] Hoparlor adaylari: {out_candidates}")
             stream = None
             last_out_err = None
@@ -1897,7 +1935,11 @@ class JarvisLive:
                 print("[JARVIS] ⏳ Hoparlör devre kesici açık, deneme atlanıyor.")
             else:
                 for cand in out_candidates:
-                    resolved = _resolve_audio_device("output", _audio_device_identity("output", cand))
+                    resolved = _resolve_audio_device(
+                        "output",
+                        _audio_device_identity("output", cand, devices=_devices_snapshot),
+                        devices=_devices_snapshot,
+                    )
                     if resolved is None:
                         last_out_err = RuntimeError("output device changed or is ambiguous")
                         continue
@@ -1939,7 +1981,7 @@ class JarvisLive:
                 continue
 
             _speaker_breaker.record_success()
-            name = _audio_device_name(chosen_device)
+            name = _audio_device_name(chosen_device, devices=_devices_snapshot)
             print(f"[JARVIS] 🔊 Hoparlor cihazi: {chosen_device} - {name}")
             try:
                 self.ui.set_speaker_device(name)
@@ -1960,6 +2002,10 @@ class JarvisLive:
                             and self.audio_in_queue.empty()
                         ):
                             self.set_speaking(False)
+                            try:
+                                self.ui.set_voice_volume(0.0)
+                            except Exception:
+                                pass
                             self._turn_done_event.clear()
                         continue
                     self.set_speaking(True)
@@ -1967,6 +2013,11 @@ class JarvisLive:
                         await asyncio.to_thread(stream.write, chunk)
                         _played_chunks += 1
                         _last_audio_at = time.monotonic()
+                        try:
+                            self.ui.set_voice_volume(_pcm_rms_level(chunk))
+                            self.ui.set_voice_state("ASSISTANT_SPEAKING", "JARVIS yanıt veriyor")
+                        except Exception:
+                            pass
                         if _played_chunks == 1:
                             print("[AUDIO_DIAG] İlk Gemini ses paketi hoparlör stream'ine yazıldı.")
                         elif _played_chunks % 200 == 0:

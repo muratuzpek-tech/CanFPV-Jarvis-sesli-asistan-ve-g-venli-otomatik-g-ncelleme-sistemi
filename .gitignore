@@ -8,7 +8,7 @@ dist/
 .pytest_cache/
 .ruff_cache/
 
-# Sırlar — ASLA depoya girmez
+# Sirlar - ASLA depoya girmez
 config/api_keys.json
 src/jarvis/config/api_keys.json
 config/certs/
@@ -17,7 +17,7 @@ src/jarvis/config/certs/
 *.pem
 .env
 
-# Çalışma zamanı verisi (kullanıcıya ait; artık %LOCALAPPDATA%/MuratJARVIS altında)
+# Calisma zamani verisi (kullaniciya ait; artik %LOCALAPPDATA%/MuratJARVIS altinda)
 logs/
 tasks/
 src/jarvis/memory/*.json
@@ -25,13 +25,20 @@ src/jarvis/memory/*.jsonl
 src/jarvis/memory/*.db
 src/jarvis/memory/quarantine/
 
-# Geliştirici arşivi — dağıtıma girmez
+# Gelistirici arsivi - dagitima girmez
 developer_archive/
 
-# Eski elle alınmış yedekler (bir daha üretilmemeli: sürüm kontrolü git'tir)
+# Eski elle alinmis yedekler (bir daha uretilmemeli: surum kontrolu git'tir)
 *.bak
 *.bak_*
 *.broken_current_backup
 ui_v4*.py
 ui_v41*.py
 *-1.py
+
+# self_improve otomatik degisiklik-oncesi yedekleri - kaynak kod degil, uretilen veri
+src/jarvis_yedekler/
+
+# Self-improve sandbox log ciktilari - klasor yapisini .gitkeep ile koru, icerigi yok say
+src/jarvis/self_improvement/sandbox/logs/*
+!src/jarvis/self_improvement/sandbox/logs/.gitkeep
