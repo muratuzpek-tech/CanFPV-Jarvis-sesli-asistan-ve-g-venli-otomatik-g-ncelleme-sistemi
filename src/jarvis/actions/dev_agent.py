@@ -747,12 +747,14 @@ def _build_project(
 
     _open_vscode(project_dir)
 
-    last_output   = ""
-    auto_installs = 0  
+    last_output      = ""
+    auto_installs    = 0
+    timeout_extended = False
+    current_timeout  = timeout
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
-        last_output = _run_project(run_command, project_dir, timeout)
+        last_output = _run_project(run_command, project_dir, current_timeout)
         log(f"Output preview: {last_output[:150]}")
 
         if last_output.startswith("REFUSED:"):
@@ -768,6 +770,30 @@ def _build_project(
             return f"{msg}\n\n{last_output}"
 
         if not _has_error(last_output, run_command):
+            if last_output.startswith("Timed out"):
+                # _has_error() timeout'u kasitli olarak hata SAYMIYOR (bir sunucu/
+                # GUI kasitli olarak surekli calisabilir), AMA bu hicbir sey
+                # DOGRULANMADI demektir - antivirus/soguk-import gecikmesi ya da
+                # gercekten takili kalmis bozuk bir betik de ayni ciktiyi verir
+                # (2026-09-21'de canli testte gozlemlendi: Norton 360 taramasi
+                # yuzunden ilk import 30sn'yi asti). Once, henuz kullanilmadiysa,
+                # BIR KEZ uzatilmis timeout ile tekrar denenir - fresh bir pip
+                # install sonrasi soguk import gecikmesini karsilamak icin.
+                if not timeout_extended and attempt < MAX_FIX_ATTEMPTS:
+                    timeout_extended = True
+                    current_timeout = timeout * 3
+                    log(f"Zaman asimi - {current_timeout}s ile bir kez daha deneniyor (soguk import/antivirus taramasi olabilir)...")
+                    time.sleep(1)
+                    continue
+                msg = (
+                    f"'{proj_name}' projesi {current_timeout} saniye içinde tamamlanmadı, efendim. "
+                    f"Bu, kasıtlı olarak sürekli çalışan bir sunucu/GUI uygulaması olabilir — AMA "
+                    f"betiğin gerçekten doğru çalıştığını DOĞRULAYAMADIM, takılı kalmış da olabilir. "
+                    f"Dosyalar {project_dir} içinde duruyor, lütfen VSCode'dan elle kontrol edin."
+                )
+                if speak: speak(msg)
+                return f"{msg}\n\nOutput:\n{last_output}"
+
             msg = (
                 f"Project '{proj_name}' is working, sir. "
                 f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
