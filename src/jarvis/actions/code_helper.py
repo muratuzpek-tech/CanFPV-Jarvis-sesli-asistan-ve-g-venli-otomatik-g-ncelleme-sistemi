@@ -2,6 +2,7 @@ import subprocess
 import sys
 import re
 import time
+import secrets
 from pathlib import Path
 
 
@@ -109,6 +110,103 @@ def _resolve_save_path(output_path: str, language: str) -> Path:
     return DESKTOP / f"jarvis_code{ext}"
 
 
+# --- Yazma hedefi guvenlik politikasi -------------------------------------
+#
+# GERCEK RISK (denetim bulgusu F-01): _resolve_save_path() mutlak bir
+# output_path'i (ör. "/etc/cron.d/x", "C:\\Program Files\\...") OLDUGU GIBI
+# donduruyordu - hicbir izin kokune bagli degildi. code_helper "guvenilir ic
+# bilesen" sayilmisti ama yol/model ciktisi aslinda kullanici/model girdisi.
+# Asagidaki tek politika noktasi, file_controller._is_safe_path ile AYNI
+# kurali (kullanici ev dizini disina cikma yasagi, sembolik link ile disari
+# tasma REDDEDILIR) kod yazma yollarina da uygular.
+def _is_within_home(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        home = Path.home().resolve()
+        return resolved == home or resolved.is_relative_to(home)
+    except Exception:
+        return False
+
+
+class UnsafeWriteTarget(Exception):
+    """resolve_write_target() hedefin kullanici ev dizini disinda oldugunu
+    tespit ettiginde firlatilir - diske HICBIR yazma yapilmadan."""
+
+
+def resolve_write_target(output_path: str, language: str) -> Path:
+    """TUM kod-yazma yollarinin (write/optimize'in yeni-dosya dali) GECTIGI
+    TEK politika noktasi. Hedef kullanici ev dizini disindaysa YAZMADAN
+    ONCE reddeder."""
+    target = _resolve_save_path(output_path, language)
+    if not _is_within_home(target):
+        raise UnsafeWriteTarget(
+            f"Güvenlik: '{target}' kullanıcı ana dizini dışında olduğu için "
+            f"buraya yazma reddedildi. Lütfen Masaüstü, Belgeler veya proje "
+            f"klasörünüz gibi ana dizin içinde bir konum belirtin."
+        )
+    return target
+
+
+# Var olan bir dosyanin UZERINE YAZILMASI (edit/optimize), acik kullanici
+# onayi olmadan otomatik yapilmaz (F-01: "code_helper ... mevcut dosyaları
+# değiştirebiliyor"). Iki adimli onay, file_controller.move_file ile AYNI
+# desendedir: ilk cagri hicbir dosyaya dokunmaz, onaylanmis icerigi saklayip
+# kisa omurlu bir kod doner; gercek yazma SADECE dogru kodla olur.
+_pending_code_edits: dict[str, tuple[Path, str]] = {}
+
+
+def _confirm_and_save(path: Path, content: str, confirm_code: str = "") -> str:
+    if not path.exists():
+        # Yeni dosya - uzerine yazilacak mevcut icerik yok, dogrudan kaydet.
+        return _save_file(path, content)
+    if not confirm_code:
+        code = secrets.token_hex(3)
+        _pending_code_edits[code] = (path, content)
+        return (
+            f"ONAY GEREKLİ (henüz kaydedilmedi): '{path}' zaten var, üzerine "
+            f"yazılacak. Kullanıcı SESLİ/YAZILI olarak açıkça onaylarsa, aynı "
+            f"eylemi confirm_code='{code}' parametresiyle TEKRAR çağırın. "
+            f"Kullanıcı onaylamadan bu kodu kendi kendine kullanma.\n\n"
+            f"Önizleme:\n{_preview(content)}"
+        )
+    pending = _pending_code_edits.pop(confirm_code, None)
+    if pending is None or pending[0] != path or pending[1] != content:
+        return "Onay kodu geçersiz veya süresi dolmuş. Önce confirm_code vermeden çağırıp yeni önizleme/kod alın."
+    return _save_file(path, content)
+
+
+_RETRYABLE_WINERRORS = (32, 33)  # ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+
+
+def _write_bytes_with_retry(path: Path, data: bytes, attempts: int = 3, base_delay: float = 0.2) -> None:
+    """DUZELTME (denetim bulgusu F-03): dosya kilidi/OneDrive senkron
+    catismalarinda kisa, sinirli exponential backoff ile yeniden dener;
+    kalici basarisizlikta WinError 32/33'u kullaniciya anlamli bir mesaja
+    cevirir (eskiden sadece genel 'Exception' ile yakalaniyordu)."""
+    last_exc: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            path.write_bytes(data)
+            return
+        except OSError as exc:
+            last_exc = exc
+            winerror = getattr(exc, "winerror", None)
+            retryable = winerror in _RETRYABLE_WINERRORS
+            if not retryable or attempt == attempts - 1:
+                if retryable:
+                    raise RuntimeError(
+                        f"Dosya başka bir uygulama veya OneDrive tarafından "
+                        f"kullanılıyor: {path.name}. İlgili programı/senkronizasyonu "
+                        f"kapatıp tekrar deneyin."
+                    ) from exc
+                if isinstance(exc, PermissionError) or winerror == 5:
+                    raise RuntimeError(f"İzin reddedildi: {path.name}.") from exc
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    if last_exc:
+        raise last_exc
+
+
 def _read_file(file_path: str) -> tuple[str, str]:
     if not file_path:
         return "", "No file path provided."
@@ -129,10 +227,14 @@ def _save_file(path: Path, content: str) -> str:
             from datetime import datetime
             stamp  = datetime.now().strftime("%Y%m%d-%H%M%S")
             backup = path.with_name(f"{path.stem}.{stamp}.bak{path.suffix}")
-            backup.write_text(path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+            # DUZELTME (denetim bulgusu F-10): yedek artik BYTE duzeyinde
+            # aliniyor (read_bytes/write_bytes) - eskiden read_text(errors=
+            # "replace") kullanildigi icin bozuk/farkli kodlamali dosyalarda
+            # yedek, ORIJINALIN birebir kopyasi OLMUYORDU (sessiz veri kaybi).
+            _write_bytes_with_retry(backup, path.read_bytes())
             backup_note = f" (yedek: {backup.name})"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        _write_bytes_with_retry(path, content.encode("utf-8"))
         return f"Saved to: {path}{backup_note}"
     except Exception as e:
         print(f"[Code] 🔍 TEŞHİS hata: {type(e).__name__}: {e}")
@@ -228,7 +330,7 @@ Code:"""
 
     response = model.generate_content(prompt)
     code     = _clean_code(response.text)
-    path     = _resolve_save_path(output_path, lang)
+    path     = resolve_write_target(output_path, lang)
     _save_file(path, code)
     return code, path
 
@@ -355,7 +457,7 @@ def _write_action(description, language, output_path, player) -> str:
         return f"Could not generate code: {e}"
 
 
-def _edit_action(file_path, instruction, player) -> str:
+def _edit_action(file_path, instruction, player, confirm_code: str = "") -> str:
     if not file_path:
         return "Please provide a file path to edit, sir."
     if not instruction:
@@ -387,7 +489,10 @@ Updated code:"""
         print(f"[Code] ❌ Edit hatası (gerçek detay): {type(e).__name__}: {e}")
         return f"Could not edit code: {e}"
 
-    status = _save_file(Path(file_path), edited)
+    # DUZELTME (denetim bulgusu F-01): mevcut bir dosyanin uzerine yazmak
+    # ACIK kullanici onayi gerektirir - _confirm_and_save ilk cagrida hicbir
+    # seye dokunmaz, sadece onizleme + onay kodu doner.
+    status = _confirm_and_save(Path(file_path), edited, confirm_code)
     print(f"[Code] ✅ Edited: {file_path}")
     return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
 
@@ -431,7 +536,7 @@ def _run_action(file_path, args, timeout, player) -> str:
     return _run_file(p, args, timeout)
 
 
-def _optimize_action(file_path, code, language, output_path, player) -> str:
+def _optimize_action(file_path, code, language, output_path, player, confirm_code: str = "") -> str:
 
     if file_path and not code:
         code, err = _read_file(file_path)
@@ -466,13 +571,18 @@ Optimized code:"""
     except Exception as e:
         return f"Could not optimize code: {e}"
 
-    # Kaydet
+    # Kaydet. Mevcut bir dosyanin (file_path) uzerine yazmak ACIK kullanici
+    # onayi gerektirir (F-01); yeni bir dosya (output_path) ev dizini disina
+    # cikamaz (resolve_write_target).
     if file_path:
         save_path = Path(file_path)
+        status = _confirm_and_save(save_path, optimized, confirm_code)
     else:
-        save_path = _resolve_save_path(output_path, lang)
-
-    status = _save_file(save_path, optimized)
+        try:
+            save_path = resolve_write_target(output_path, lang)
+        except UnsafeWriteTarget as e:
+            return str(e)
+        status = _save_file(save_path, optimized)
     print(f"[Code] ✅ Optimized: {save_path}")
 
     original_lines  = len(code.splitlines())
@@ -554,11 +664,18 @@ Be specific and actionable. If you see an error message, quote it exactly."""
 
             code_match = re.search(r"```[a-zA-Z]*\n(.*?)```", analysis, re.DOTALL)
             if code_match:
-                fixed_code = code_match.group(1).strip()
-                save_path  = Path(file_path)
-                _save_file(save_path, fixed_code)
-                analysis += f"\n\n✅ Fixed code has been saved to: {file_path}"
-                print(f"[Code] ✅ Fixed code saved: {file_path}")
+                # DUZELTME (denetim bulgusu F-01): model ciktisini OTOMATIK
+                # olarak dosyaya yazmak, kullanicinin hic onay vermedigi bir
+                # dosya degisikligi anlamina geliyordu. Simdi sadece ONERI
+                # sunulur; gercek kaydetme SADECE kullanici acikca
+                # onayladiktan sonra, AYRI bir 'edit' cagrisiyla (kendi
+                # onay kapisindan gecerek) yapilir.
+                analysis += (
+                    f"\n\n💡 Düzeltilmiş kod önerisi hazırlandı ancak dosyaya "
+                    f"KAYDEDİLMEDİ. Kaydetmemi isterseniz onaylayın, ardından "
+                    f"'edit' eylemiyle {file_path} üzerine uygulayabilirim."
+                )
+                print(f"[Code] ℹ️ Fixed code proposed (not auto-saved): {file_path}")
 
         return analysis
 
@@ -600,6 +717,7 @@ def code_helper(
     code        = p.get("code", "").strip()
     args        = p.get("args", [])
     timeout     = int(p.get("timeout", 30))
+    confirm_code = str(p.get("confirm_code", "")).strip()
 
     if action == "auto":
         action = _detect_intent(description, file_path, code)
@@ -612,7 +730,8 @@ def code_helper(
         return _edit_action(
             file_path,
             description or p.get("instruction", ""),
-            player
+            player,
+            confirm_code,
         )
 
     elif action == "explain":
@@ -625,7 +744,7 @@ def code_helper(
         return _build(description, language, output_path, args, timeout, speak, player)
 
     elif action == "optimize":
-        return _optimize_action(file_path, code, language, output_path, player)
+        return _optimize_action(file_path, code, language, output_path, player, confirm_code)
 
     elif action == "screen_debug":
         return _screen_debug_action(description, file_path, player, speak)

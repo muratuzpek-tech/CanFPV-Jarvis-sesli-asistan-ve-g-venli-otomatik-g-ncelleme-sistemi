@@ -193,6 +193,7 @@ def add_task(goal: str) -> str:
         "goal":       goal,
         "status":     "pending",
         "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
         "history":    [],
         "pending_action": None,
     }
@@ -301,6 +302,26 @@ def cancel_task(task_id: str) -> str:
     return f"'{task_id}' görevi tamamen iptal edildi, bir daha işlenmeyecek."
 
 
+def retry_task(task_id: str) -> str:
+    """Requeue a terminal failed/cancelled task without losing its history."""
+    with _tasks_lock:
+        tasks = _load_tasks()
+        task = _find_task(tasks, task_id)
+        if task is None:
+            return f"'{task_id}' id'li görev bulunamadı."
+        if task.get("status") not in ("failed", "cancelled"):
+            return f"'{task_id}' yeniden denenemez (durum: {task.get('status')})."
+        task["status"] = "pending"
+        task["updated_at"] = datetime.now().isoformat()
+        task["pending_action"] = None
+        task.pop("error", None)
+        task["planning_retries"] = 0
+        task.setdefault("history", []).append({"note": "Kullanıcı görevi yeniden denedi.", "result": "requeued"})
+        _save_tasks(tasks)
+    _log_event({"event": "retried", "task_id": task_id})
+    return f"'{task_id}' görevi yeniden kuyruğa alındı."
+
+
 def _notify_pending_approval(task: dict, tool: str, parameters: dict, note: str) -> None:
     """GUVENLIK NOTU (2026-09-15, YENIDEN UYGULANDI): Bu fonksiyon eskiden
     gercek _call_send_message('whatsapp') ile mesaj gonderiyordu.
@@ -346,8 +367,39 @@ def _run_readonly_github_research(task: dict) -> bool:
     return True
 
 
+_MUTATING_FC_ACTIONS = {
+    "create_file", "create_folder", "write", "find_replace",
+    "delete", "delete_all_files", "move", "copy", "rename",
+}
+
+
+def _looks_like_file_mutation_goal(goal: str) -> bool:
+    g = (goal or "").lower()
+    return any(k in g for k in (
+        "düzenle", "duzenle", "değiştir", "degistir", "yaz", "oluştur",
+        "olustur", "sil", "taşı", "tasi", "kopyala", "yeniden adlandır",
+    ))
+
+
+def _has_mutating_file_step(history: list) -> bool:
+    # DUZELTME (canli testte bulundu, 2026-09-22): model gecmiste HICBIR
+    # gercek dosya degistirme adimi olmadan "done: true" diyebiliyordu ve
+    # bu KORUKORUNE kabul ediliyordu (dosya "duzenlendi" denip aslinda hic
+    # degismemisti). Simdi bir dosya-mutasyon hedefi icin, gecmiste
+    # GERCEKTEN basarili bir mutasyon adimi arandi - yoksa "done" reddedilir.
+    for h in history:
+        if h.get("tool") == "file_controller":
+            params = h.get("parameters") or {}
+            if params.get("action") in _MUTATING_FC_ACTIONS:
+                result = str(h.get("result", "")).lower()
+                if not result.startswith(("could not", "access denied", "file not found", "not a file")):
+                    return True
+    return False
+
+
 def _process_task(task: dict, tasks: list[dict]) -> None:
     task["status"] = "running"
+    task["updated_at"] = datetime.now().isoformat()
     if _run_readonly_github_research(task):
         return
     step_count = len(task.get("history", []))
@@ -360,13 +412,24 @@ def _process_task(task: dict, tasks: list[dict]) -> None:
     try:
         step = _decide_next_step(task)
     except Exception as e:
+        error_text = str(e)
+        quota_error = any(marker in error_text.upper() for marker in ("429", "RESOURCE_EXHAUSTED", "QUOTA EXCEEDED"))
+        if quota_error:
+            task["status"] = "failed"
+            task["error"] = "Gemini API kotası doldu; kota yenilendiğinde görevi yeniden deneyin."
+            task.setdefault("history", []).append({
+                "note": "Planlama kota nedeniyle durduruldu.",
+                "result": f"QUOTA_ERROR: {error_text}",
+            })
+            _log_event({"event": "planning_quota_exhausted", "task_id": task["id"]})
+            return
         retries = int(task.get("planning_retries", 0)) + 1
         task["planning_retries"] = retries
         task.setdefault("history", []).append({
             "note": f"Planlama denemesi {retries}/{MAX_PLANNING_RETRIES} başarısız oldu.",
-            "result": f"PLAN_ERROR: {e}",
+            "result": f"PLAN_ERROR: {error_text}",
         })
-        _log_event({"event": "planning_failed", "task_id": task["id"], "error": str(e)})
+        _log_event({"event": "planning_failed", "task_id": task["id"], "error": error_text})
         if retries >= MAX_PLANNING_RETRIES:
             task["status"] = "failed"
             task["error"] = (
@@ -379,6 +442,16 @@ def _process_task(task: dict, tasks: list[dict]) -> None:
         return
 
     if step.get("done"):
+        goal = task.get("goal", "")
+        if _looks_like_file_mutation_goal(goal) and not _has_mutating_file_step(task.get("history", [])):
+            task.setdefault("history", []).append({
+                "note": ("Model görevi 'tamamlandı' saydı ama geçmişte gerçek bir "
+                         "dosya değiştirme adımı bulunamadı - sahte tamamlanma "
+                         "reddedildi, gerçek araç çağrısı zorlanacak."),
+                "result": "REJECTED_FAKE_DONE",
+            })
+            _log_event({"event": "fake_done_rejected", "task_id": task["id"], "claimed_note": step.get("note", "")})
+            return
         task["status"] = "done"
         task["planning_retries"] = 0
         task["history"].append({"note": step.get("note", "Tamamlandı."), "result": "done"})
@@ -497,10 +570,12 @@ def _tick() -> None:
     with _tasks_lock:
         tasks = _load_tasks()
         discovery_changed = _run_discovery_scan(tasks)
-
-        pending = [t for t in tasks if t["status"] == "pending"]
-        if pending:
-            _process_task(pending[0], tasks)
+        # A task becomes running while its planner/tool step is in flight.
+        # Selecting only pending tasks left every such task permanently stuck.
+        active = [t for t in tasks if t.get("status") in ("pending", "running")]
+        if active:
+            active.sort(key=lambda item: str(item.get("created_at", "")))
+            _process_task(active[0], tasks)
             _save_tasks(tasks)
         elif discovery_changed:
             _save_tasks(tasks)
@@ -548,4 +623,6 @@ def agent_loop_tool(parameters: dict = None, player=None) -> str:
     # gider ki model hangisini secerse secsin calissin.
     if action in ("cancel", "remove"):
         return cancel_task(params.get("task_id", ""))
-    return f"Bilinmeyen action: '{action}'. add/list/approve/deny/cancel kullanın."
+    if action == "retry":
+        return retry_task(params.get("task_id", ""))
+    return f"Bilinmeyen action: '{action}'. add/list/approve/deny/cancel/retry kullanın."

@@ -224,7 +224,7 @@ def match_file_modification(text: str) -> dict | None:
     destructive = (
         "sil", "delete", "move",
         "rename", "tasi", "degistir", "duzelt",
-        "kaldir",
+        "kaldir", "duzenle", "düzenle",
     )
     if any(x in low for x in destructive):
         return None
@@ -285,6 +285,29 @@ def match_file_modification(text: str) -> dict | None:
         )
         if m2:
             content = m2.group(1).strip().strip("'\"")
+
+    # GUVENLIK (2026-09-22, canli testte tespit edildi): bu fonksiyon SADECE
+    # gercekten YENI bir dosya olusturma/yazma icin ONAYSIZ gorev
+    # uretmelidir (bkz. yukaridaki "FILE_MODIFICATION v1" notu). Hedef dosya
+    # DISKTE ZATEN VARSA burada sessizce/onaysiz ust yazilmasina IZIN VERME -
+    # None don ki istek normal, onayli (code_helper/confirm_code korumali)
+    # akisa dussun. Somut hata: "... duzenle, print('eski') yerine
+    # print('yeni') yaz" cumlesi yanlis ayristirilip var olan dosyanin
+    # tum icerigini "eski" gibi anlamsiz bir degerle ust yazmaya
+    # calismisti - hicbir onay istemeden.
+    try:
+        from jarvis.actions.file_controller import _resolve_path as _fc_resolve_path
+        from jarvis.actions.file_controller import _resolve_target_name as _fc_resolve_target_name
+        _base_dir = _fc_resolve_path(path)
+        _target, _err = _fc_resolve_target_name(_base_dir, name)
+        target_exists = bool(_err) or (_target is not None and _target.exists())
+    except Exception:
+        # Cozumleme basarisiz olursa GUVENLI TARAFTA KAL: var kabul et,
+        # oto-eslesmeyi iptal et.
+        target_exists = True
+
+    if target_exists:
+        return None
 
     if has_create:
         result = {

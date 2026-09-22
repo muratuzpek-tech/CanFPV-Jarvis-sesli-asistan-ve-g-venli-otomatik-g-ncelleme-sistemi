@@ -44,6 +44,7 @@ BASE_DIR    = Path(__file__).resolve().parent.parent
 STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
+_TOKEN_TTL_SECS = 12 * 60 * 60
 
 
 def _make_uploads_dir() -> Path:
@@ -384,6 +385,7 @@ class DashboardServer:
         self._ip                          = _local_ip()
         self._tokens: set[str]            = set()
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
+        self._token_created: dict[str, float] = {}
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
         self._clients: set[WebSocket]     = set()
         self._history: list[dict]         = []
@@ -443,6 +445,26 @@ class DashboardServer:
         except Exception:
             return None
 
+    def _issue_token(self, session_key: str) -> str:
+        token = secrets.token_urlsafe(32)
+        self._tokens.add(token)
+        self._token_keys[token] = session_key
+        self._token_created[token] = time.time()
+        self._aes_key(session_key)
+        return token
+
+    def _valid_token(self, token: str) -> bool:
+        token = str(token or "").strip()
+        created = self._token_created.get(token)
+        if not token or token not in self._tokens or created is None:
+            return False
+        if time.time() - created > _TOKEN_TTL_SECS:
+            self._tokens.discard(token)
+            self._token_keys.pop(token, None)
+            self._token_created.pop(token, None)
+            return False
+        return True
+
     # ── callbacks ────────────────────────────────────────────────────────
 
     def set_wake_callback(self, fn) -> None:
@@ -471,8 +493,10 @@ class DashboardServer:
         app = FastAPI(docs_url=None, redoc_url=None)
 
         def _auth(req: Request) -> bool:
-            tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            return bool(tok) and tok in self._tokens
+            auth = req.headers.get("authorization", "").strip()
+            if not auth.lower().startswith("bearer "):
+                return False
+            return self._valid_token(auth[7:].strip())
 
         # serve CryptoJS from local cache, fallback to CDN redirect
         @app.get("/static/crypto.js")
@@ -520,10 +544,7 @@ class DashboardServer:
             entered = str(body.get("pin", "")).strip().upper()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 del self._pending_keys[entered]          # one-time use
-                tok = secrets.token_urlsafe(32)
-                self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
+                tok = self._issue_token(entered)
                 if self._connect_callback:
                     self._connect_callback()
                 asyncio.create_task(self.broadcast(
@@ -557,11 +578,8 @@ class DashboardServer:
 </div></body></html>""")
 
             del self._pending_keys[key]
-            tok     = secrets.token_urlsafe(32)
+            tok     = self._issue_token(key)
             dev_tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = key
-            self._aes_key(key)
             self._device_sessions[dev_tok] = {"session_key": key}
 
             if self._connect_callback:
@@ -603,10 +621,7 @@ class DashboardServer:
             if not dev_tok or dev_tok not in self._device_sessions:
                 return JSONResponse({"ok": False}, status_code=401)
             session_key = self._device_sessions[dev_tok]["session_key"]
-            tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = session_key
-            self._aes_key(session_key)
+            tok = self._issue_token(session_key)
             if self._connect_callback:
                 self._connect_callback()
             asyncio.create_task(self.broadcast(
@@ -621,6 +636,9 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             count = len(self._device_sessions)
             self._device_sessions.clear()
+            self._tokens.clear()
+            self._token_keys.clear()
+            self._token_created.clear()
             return JSONResponse({"ok": True, "revoked": count})
 
         @app.post("/api/command")
@@ -665,7 +683,7 @@ class DashboardServer:
         @app.websocket("/ws/phone-audio")
         async def phone_audio_ws(websocket: WebSocket, token: str = ""):
             tok = token.strip()
-            if not tok or tok not in self._tokens:
+            if not self._valid_token(tok):
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
@@ -794,7 +812,7 @@ class DashboardServer:
         async def download_file(filename: str, token: str = ""):
             # Auth via query param — browser <a download> can't send custom headers
             tok = token.strip()
-            if not tok or tok not in self._tokens:
+            if not self._valid_token(tok):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             safe = _safe_filename(filename)
             root = self._uploads_dir.resolve()
@@ -808,7 +826,7 @@ class DashboardServer:
         @app.websocket("/ws")
         async def ws_ep(websocket: WebSocket, token: str = ""):
             tok = token.strip()
-            if not tok or tok not in self._tokens:
+            if not self._valid_token(tok):
                 await websocket.close(code=4001)
                 return
             await websocket.accept()

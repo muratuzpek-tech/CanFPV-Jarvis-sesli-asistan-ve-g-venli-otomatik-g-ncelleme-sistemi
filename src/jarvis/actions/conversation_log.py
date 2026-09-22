@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from jarvis.paths import memory_dir
+from jarvis.memory.sanitizer import sanitize
 
 
 def _get_base_dir() -> Path:
@@ -34,7 +35,7 @@ def log_turn(role: str, text: str) -> None:
         entry = {
             "timestamp": datetime.now().isoformat(),
             "role": role,
-            "text": text[:MAX_TEXT_CHARS],
+            "text": sanitize(text)[:MAX_TEXT_CHARS],
         }
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -53,6 +54,27 @@ def _rotate_if_needed() -> None:
         LOG_PATH.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
     except Exception as e:
         print(f"[ConversationLog] ⚠️ Rotasyon başarısız: {e}")
+
+
+MAX_RECALL_MINUTES = 24 * 60  # bir gunden fazlasi icin period/date kullanilmali
+
+
+def _minutes_range(minutes) -> tuple[datetime, datetime] | None:
+    """'10 dakika once ne demistim' gibi GUNE BAGLI OLMAYAN, yakin-zamanli
+    sorular icin - GERCEK YASANAN SORUN: _date_range sadece bugun/dun/bu_hafta/
+    gecen_hafta veya tam tarih kabul ediyordu, kullanici 'demin'/'10 dakika
+    once' dedigi anda Jarvis hangi GUNU kastettigini sormaya basliyordu -
+    oysa istenen bilgi ayni gunun icindeydi ve zaten conversation_log.jsonl'da
+    duruyordu, sadece bu araç ona bu granularitede erisemiyordu."""
+    try:
+        mins = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    if mins <= 0:
+        return None
+    mins = min(mins, MAX_RECALL_MINUTES)
+    now = datetime.now()
+    return now - timedelta(minutes=mins), now + timedelta(minutes=1)
 
 
 def _date_range(period: str, explicit_date: str | None = None) -> tuple[datetime, datetime] | None:
@@ -117,23 +139,29 @@ OZET:"""
 
 def recall_conversation(parameters: dict) -> str:
     """Ana giriş noktası - main.py'den bir tool olarak çağrılır.
-    parameters: period ('bugun'|'dun'|'bu_hafta'|'gecen_hafta') VEYA
-    date ('YYYY-MM-DD'), topic (opsiyonel, özeti belirli bir konuya odaklar)."""
+    parameters: minutes (int, 'demin'/'10 dakika önce' gibi yakın-zamanlı
+    sorular için - varsa period/date'den ONCELIKLIDIR) VEYA period
+    ('bugun'|'dun'|'bu_hafta'|'gecen_hafta') VEYA date ('YYYY-MM-DD'),
+    topic (opsiyonel, özeti belirli bir konuya odaklar)."""
     p = parameters or {}
     period = p.get("period", "")
     explicit_date = p.get("date", "")
+    minutes = p.get("minutes")
     topic = (p.get("topic") or "").strip()
 
-    rng = _date_range(period, explicit_date)
+    rng = _minutes_range(minutes) if minutes not in (None, "") else None
+    if rng is None:
+        rng = _date_range(period, explicit_date)
     if rng is None:
         return ("Hangi zaman aralığını kastettiğini anlayamadım — "
-                "bugün, dün, bu hafta, geçen hafta ya da belirli bir tarih olabilir.")
+                "az önce/kaç dakika önce, bugün, dün, bu hafta, geçen hafta "
+                "ya da belirli bir tarih olabilir.")
 
     start, end = rng
     entries = _load_entries(start, end)
     if not entries:
-        label = explicit_date or period
-        return f"'{label}' için kayıtlı bir konuşma bulamadım — o tarihte kayıt tutulmuyor olabilir."
+        label = explicit_date or period or (f"son {minutes} dakika" if minutes else "")
+        return f"'{label}' için kayıtlı bir konuşma bulamadım — o aralıkta kayıt tutulmuyor olabilir."
 
     transcript = "\n".join(f"{e['role']}: {e['text']}" for e in entries)[:MAX_SUMMARY_CHARS]
     topic_hint = f" Özellikle '{topic}' konusuna odaklan." if topic else ""

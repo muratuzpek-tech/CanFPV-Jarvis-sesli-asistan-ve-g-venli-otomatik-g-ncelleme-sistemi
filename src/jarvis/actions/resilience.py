@@ -30,8 +30,14 @@ from jarvis.paths import memory_dir
 # --- Hata siniflandirmasi -----------------------------------------------
 
 TERMINAL_CODES  = {400, 401, 403}          # asla retry etme
-RETRYABLE_CODES = {429, 500, 502, 503, 504, 529}
+RETRYABLE_CODES = {500, 502, 503, 504, 529}
 FALLBACK_CODES  = {404}                    # model kullanimdan kaldirilmis
+# 429, gercek kullanicida (error_log.json'da) 503 ile ayni "retryable" kovaya
+# konulmustu, ama ikisi cok farkli: 503 saniyeler icinde duzelebilecek gecici
+# bir sunucu yogunlugu, 429 RESOURCE_EXHAUSTED ise dakikalik/gunluk KOTA
+# asimi - saniyeler icinde tekrar denemek asla basarili olmaz, sadece kotayi
+# (ve gercek sesli oturumun payini) daha da tuketir. Ayri siniflandiriliyor.
+QUOTA_CODES     = {429}
 
 
 def _extract_status_code(exc: Exception) -> int | None:
@@ -49,12 +55,15 @@ def _extract_status_code(exc: Exception) -> int | None:
 
 
 def classify_error(exc: Exception) -> str:
-    """'terminal' | 'retryable' | 'fallback' | 'unknown' dondurur."""
+    """'terminal' | 'retryable' | 'quota' | 'fallback' | 'unknown' dondurur."""
     code = _extract_status_code(exc)
+    text = str(exc).lower()
     if code in TERMINAL_CODES:
         return "terminal"
     if code in FALLBACK_CODES:
         return "fallback"
+    if code in QUOTA_CODES or "resource_exhausted" in text:
+        return "quota"
     if code in RETRYABLE_CODES:
         return "retryable"
     return "unknown"
@@ -326,12 +335,20 @@ def call_with_resilience(
                     breaker.record_failure()
                 raise ModelFallbackNeeded(exc) from exc
 
-            # 'retryable' veya 'unknown': jitter'li backoff ile tekrar dene
+            # 'retryable', 'quota' veya 'unknown': jitter'li backoff ile tekrar dene
             if breaker is not None:
                 breaker.record_failure()
             if attempt < max_attempts - 1:
-                delay = min(max_delay, base_delay * (2 ** attempt))
-                delay = random.uniform(0, delay)  # full jitter
+                if kind == "quota":
+                    # 429 RESOURCE_EXHAUSTED saniyeler icinde duzelmez -
+                    # kisa backoff'la hemen tekrar vurmak sadece ayni kotayi
+                    # (ve canli sesli oturumun payini) bosa harcar. En az
+                    # 20-45sn bekle; asagidaki tekrarlayan-hata onlemi de
+                    # normal sekilde uzerine eklenir.
+                    delay = random.uniform(20.0, 45.0)
+                else:
+                    delay = min(max_delay, base_delay * (2 ** attempt))
+                    delay = random.uniform(0, delay)  # full jitter
                 if mitigation:
                     # Bu hata daha once de tekrar tekrar gorulmus - ekstra
                     # sabir goster, aynı hizda vurup durma.

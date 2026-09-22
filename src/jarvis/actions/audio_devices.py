@@ -25,6 +25,7 @@ EXCLUDE: tuple[str, ...] = (
     "sound mapper",
     "mapper",
     "vb-audio",
+    "voicemod",
 )
 _UNSUPPORTED_HOSTAPIS: tuple[str, ...] = ("wdm-ks",)
 _NAME_HINTS: dict[str, tuple[str, ...]] = {
@@ -83,6 +84,30 @@ def _hostapi_name(hostapi_index: int | None, hostapi_cache: dict[int, str]) -> s
     return name
 
 
+_RAW_PLACEHOLDER_MARKERS: tuple[str, ...] = (
+    "system32\\drivers",
+    "system32/drivers",
+)
+
+
+def _looks_like_unresolved_name(name: str) -> bool:
+    """True for the raw, not-yet-resolved MUI placeholder some Bluetooth
+    Hands-Free drivers (bthhfenum.sys) briefly report instead of a clean
+    device name - GERCEK KANIT: audio_prefs.json'da bir kullanicida su
+    tam metin bulundu: '@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free
+    %0\\r\\n;(Aldin - AirPods Pro #2))'. Boyle bir isim daha sonraki temiz
+    bir enumerasyonla neredeyse hicbir zaman tam eslesmeyecegi icin, ne
+    kaydedilmeli (set_audio_prefs) ne de eslestirmede kullanilmalidir
+    (_preference) - 'tercih yok' gibi davranip 'named'/'preferred' katmanina
+    dusmesine izin vermek cok daha guvenilir."""
+    if not isinstance(name, str):
+        return False
+    low = name.lower()
+    if any(marker in low for marker in _RAW_PLACEHOLDER_MARKERS):
+        return True
+    return "\r" in name or "\n" in name
+
+
 def get_audio_prefs() -> dict[str, Any]:
     """Load preferences safely; malformed values fall back to auto-selection."""
     path = _prefs_path()
@@ -136,6 +161,12 @@ def set_audio_prefs(
             continue
         if not isinstance(name, str) or not name.strip():
             logger.warning("[AudioDevices] ignored malformed %s preference", kind)
+            continue
+        if _looks_like_unresolved_name(name):
+            logger.warning(
+                "[AudioDevices] ignored unresolved/raw %s device name (Bluetooth "
+                "enumeration glitch) rather than persisting it: %r", kind, name,
+            )
             continue
         prefs[f"{kind}_device_name"] = name.strip()
         if hostapi is None:
@@ -215,22 +246,43 @@ def _device_info(kind: str, index: int, devices: list[dict[str, Any]]) -> dict[s
     }
 
 
-def device_identity(kind: Literal["input", "output"] | str, index: int) -> dict[str, Any] | None:
-    """Capture the current name/host API/direction identity for numeric ID."""
+def device_identity(
+    kind: Literal["input", "output"] | str,
+    index: int,
+    devices: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Capture the current name/host API/direction identity for numeric ID.
+
+    ``devices`` lets a caller pass an already-fetched enumeration (see
+    ``resolve_device_index`` for why this matters); omit it to fetch fresh.
+    """
     if kind not in _CHANNEL_KEY:
         raise ValueError(f"Invalid kind: {kind!r}")
-    return _device_info(kind, index, list_devices())
+    return _device_info(kind, index, devices if devices is not None else list_devices())
 
 
 def resolve_device_index(
     kind: Literal["input", "output"] | str,
     identity: dict[str, Any] | None,
+    devices: list[dict[str, Any]] | None = None,
 ) -> int | None:
     """Resolve a captured identity against the latest PortAudio enumeration.
 
     The result is a numeric PortAudio ID suitable for ``InputStream`` or
     ``RawOutputStream``. Bare names and stale numeric IDs are never returned.
     An ambiguous current identity is rejected rather than choosing the first.
+
+    GERCEK YASANAN SORUN: bir cagiran (main.py) onceden adayi
+    ``get_candidates()`` ile bulup, kimligini ``device_identity()`` ile
+    yakalayip, sonra bu fonksiyonla dogruluyordu - UCU AYRI ``list_devices()``
+    (yani ayri ``sd.query_devices()``) cagrisiyla. Bazi Bluetooth Hands-Free
+    cihazlari (bthhfenum.sys) ismini enumerasyonlar arasinda TUTARSIZ
+    raporluyor (bazen duzgun "Hands-Free AG Audio (...)", bazen coz'ulmemis
+    ham "@System32\\drivers\\bthhfenum.sys,#2;%1 Hands-Free%0;(...)" MUI
+    dizesi) - uc ayri sorguda isim degisirse tam-isim eslesmesi HER SEFERINDE
+    basarisiz olur ve mikrofon/hoparlor hic acilamaz. ``devices`` verilirse
+    (ayni anda alinmis TEK bir anlik goruntu), bu yaris penceresi ortadan
+    kalkar; verilmezse eski davranis (taze sorgu) degismeden kalir.
     """
     if kind not in _CHANNEL_KEY or not isinstance(identity, dict):
         return None
@@ -240,7 +292,7 @@ def resolve_device_index(
     if not isinstance(name, str) or not isinstance(direction, str) or direction != kind:
         return None
     matches: list[int] = []
-    for index, device in enumerate(list_devices()):
+    for index, device in enumerate(devices if devices is not None else list_devices()):
         if not isinstance(device, dict) or _channel_count(device, kind) <= 0:
             continue
         current_hostapi = _as_int(device.get("hostapi"))
@@ -250,13 +302,26 @@ def resolve_device_index(
     return matches[0] if len(matches) == 1 else None
 
 
-def device_name(index: int | None) -> str:
-    """Return a display name for a current numeric ID."""
+def device_name(index: int | None, devices: list[dict[str, Any]] | None = None) -> str:
+    """Return a display name for a current numeric ID.
+
+    GERCEK YASANAN SORUN: bu fonksiyon her zaman kendi taze ``list_devices()``
+    cagirisini yapiyordu, oysa cagiran (main.py) akisi acmak icin ZATEN bir
+    ``_devices_snapshot`` kullanmisti. Windows'ta PortAudio'nun sayisal
+    indeksleri iki ayri sorgu arasinda kayabiliyor (ozellikle Bluetooth
+    cihazlar baglanip/kopunce) - bu yuzden dogru cihazda akis acilmis olsa
+    bile, ekrana yazilan isim BASKA, o an farkli bir cihaza denk gelen bir
+    indeksten okunmus olabiliyor (canli kanit: akis dogru AirPods'ta acildi
+    ama arayuzde 'Birincil Ses Yakalama Surucusu' gibi alakasiz bir isim
+    gorundu). ``devices`` verilirse (cagiranin zaten sahip oldugu ayni
+    anlik goruntu), bu kayma ortadan kalkar; verilmezse eski davranis
+    (taze sorgu) degismeden kalir.
+    """
     if index is None:
         return "Sistem varsayılanı"
     if not isinstance(index, int) or isinstance(index, bool):
         return f"#{index}"
-    devices = list_devices()
+    devices = devices if devices is not None else list_devices()
     if 0 <= index < len(devices):
         try:
             return str(devices[index].get("name", f"#{index}"))
@@ -274,6 +339,9 @@ def _preference(prefs: dict[str, Any], kind: str) -> dict[str, Any] | None:
         nested = {}
     name = nested.get("name", prefs.get(f"{kind}_device_name"))
     if not isinstance(name, str) or not name.strip():
+        return None
+    if _looks_like_unresolved_name(name):
+        logger.debug("[AudioDevices] stored %s preference looks unresolved, ignoring: %r", kind, name)
         return None
     hostapi = nested.get("hostapi", prefs.get(f"{kind}_device_hostapi"))
     direction = nested.get("direction", prefs.get(f"{kind}_device_direction", kind))
@@ -313,17 +381,23 @@ def _default_index(kind: str, devices: list[dict[str, Any]]) -> int | None:
     return None
 
 
-def candidates_with_tier(kind: Literal["input", "output"] | str) -> list[tuple[int | None, str]]:
+def candidates_with_tier(
+    kind: Literal["input", "output"] | str,
+    devices: list[dict[str, Any]] | None = None,
+) -> list[tuple[int | None, str]]:
     """Return current numeric candidates in preference order.
 
     No fabricated ``None`` candidate is returned for an empty or invalid
     device list. The system default is represented by its current numeric ID
     only after it is verified to exist and support the requested direction.
+    ``devices`` lets a caller reuse one enumeration snapshot across this call
+    and a later ``device_identity``/``resolve_device_index`` call, closing the
+    race window described in ``resolve_device_index``'s docstring.
     """
     if kind not in _CHANNEL_KEY:
         raise ValueError(f"Invalid kind: {kind!r}; expected 'input' or 'output'.")
 
-    devices = list_devices()
+    devices = devices if devices is not None else list_devices()
     hostapi_cache: dict[int, str] = {}
     infos: list[dict[str, Any]] = []
     for index, device in enumerate(devices):
@@ -397,6 +471,9 @@ def best_candidate(kind: Literal["input", "output"] | str) -> tuple[int | None, 
     return candidates[0] if candidates else (None, "no_device")
 
 
-def get_candidates(kind: Literal["input", "output"] | str) -> list[int]:
+def get_candidates(
+    kind: Literal["input", "output"] | str,
+    devices: list[dict[str, Any]] | None = None,
+) -> list[int]:
     """Return only current numeric IDs for stream-opening code."""
-    return [index for index, _tier in candidates_with_tier(kind) if isinstance(index, int)]
+    return [index for index, _tier in candidates_with_tier(kind, devices=devices) if isinstance(index, int)]

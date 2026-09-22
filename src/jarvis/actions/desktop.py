@@ -293,38 +293,54 @@ _SKIP_EXTENSIONS = {
 }
 
 
+# DUZELTME (denetim bulgusu F-08): asagidaki 4 fonksiyonun hepsinde eskiden
+# DIS bir try/except yoktu (ya da varsa TUM operasyonu sarmalayan tek bir
+# genel except'ti) - tek bir kilitli/izinsiz/OneDrive-senkron dosyanin
+# stat()/shutil.move() hatasi, henuz islenmemis TUM digerlerini de iptal
+# ediyordu. Simdi HER OGE ayri try/except ile isleniyor; basarili/atlanan/
+# basarisiz sayimlar ayri tutuluyor ve kismi basari acikca raporlaniyor.
+
 def organize_desktop(mode: str = "by_type") -> str:
-    desktop       = _get_desktop()
-    skip_exts     = _SKIP_EXTENSIONS.get(_OS, set())
-    moved, skipped = [], []
+    desktop        = _get_desktop()
+    skip_exts      = _SKIP_EXTENSIONS.get(_OS, set())
+    moved, skipped, failed = [], [], []
 
-    for item in desktop.iterdir():
-        if item.is_dir() or item.name.startswith("."):
+    try:
+        entries = list(desktop.iterdir())
+    except PermissionError:
+        return f"Permission denied: {desktop}"
+
+    for item in entries:
+        try:
+            if item.is_dir() or item.name.startswith("."):
+                continue
+            if item.suffix.lower() in skip_exts:
+                continue
+
+            if mode == "by_date":
+                mtime       = datetime.fromtimestamp(item.stat().st_mtime)
+                folder_name = mtime.strftime("%Y-%m")
+            else:
+                ext         = item.suffix.lower()
+                folder_name = "Others"
+                for folder, exts in FILE_TYPE_MAP.items():
+                    if ext in exts:
+                        folder_name = folder
+                        break
+
+            target_dir = desktop / folder_name
+            target_dir.mkdir(exist_ok=True)
+            new_path = target_dir / item.name
+
+            if new_path.exists():
+                skipped.append(item.name)
+                continue
+
+            shutil.move(str(item), str(new_path))
+            moved.append(f"{item.name} → {folder_name}/")
+        except Exception as item_exc:
+            failed.append(f"{item.name}: {item_exc}")
             continue
-        if item.suffix.lower() in skip_exts:
-            continue
-
-        if mode == "by_date":
-            mtime       = datetime.fromtimestamp(item.stat().st_mtime)
-            folder_name = mtime.strftime("%Y-%m")
-        else:
-            ext         = item.suffix.lower()
-            folder_name = "Others"
-            for folder, exts in FILE_TYPE_MAP.items():
-                if ext in exts:
-                    folder_name = folder
-                    break
-
-        target_dir = desktop / folder_name
-        target_dir.mkdir(exist_ok=True)
-        new_path = target_dir / item.name
-
-        if new_path.exists():
-            skipped.append(item.name)
-            continue
-
-        shutil.move(str(item), str(new_path))
-        moved.append(f"{item.name} → {folder_name}/")
 
     result = f"Desktop organized ({mode}): {len(moved)} files moved."
     if moved:
@@ -333,28 +349,41 @@ def organize_desktop(mode: str = "by_type") -> str:
             result += f"\n... and {len(moved) - 8} more."
     if skipped:
         result += f"\n{len(skipped)} file(s) skipped (name conflict)."
+    if failed:
+        result += f"\n{len(failed)} file(s) failed:\n" + "\n".join(failed[:5])
+        if len(failed) > 5:
+            result += f"\n... and {len(failed) - 5} more failures."
     return result
 
 
 def list_desktop() -> str:
     desktop = _get_desktop()
     items   = []
-    for item in sorted(desktop.iterdir()):
-        if item.name.startswith("."):
-            continue
-        if item.is_dir():
-            try:
-                count = len(list(item.iterdir()))
-            except PermissionError:
-                count = "?"
-            items.append(f"📁 {item.name}/ ({count} items)")
-        else:
-            size     = item.stat().st_size
-            size_str = (
-                f"{size / 1024:.1f} KB" if size < 1024 * 1024
-                else f"{size / 1024 / 1024:.1f} MB"
-            )
-            items.append(f"📄 {item.name} ({size_str})")
+
+    try:
+        entries = sorted(desktop.iterdir())
+    except PermissionError:
+        return f"Permission denied: {desktop}"
+
+    for item in entries:
+        try:
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                try:
+                    count = len(list(item.iterdir()))
+                except PermissionError:
+                    count = "?"
+                items.append(f"📁 {item.name}/ ({count} items)")
+            else:
+                size     = item.stat().st_size
+                size_str = (
+                    f"{size / 1024:.1f} KB" if size < 1024 * 1024
+                    else f"{size / 1024 / 1024:.1f} MB"
+                )
+                items.append(f"📄 {item.name} ({size_str})")
+        except OSError:
+            items.append(f"❓ {item.name} (erişilemedi)")
 
     if not items:
         return "Desktop is empty."
@@ -366,28 +395,65 @@ def clean_desktop() -> str:
     skip_exts   = _SKIP_EXTENSIONS.get(_OS, set())
     today       = datetime.now().strftime("%Y-%m-%d")
     archive_dir = desktop / f"Desktop Archive {today}"
-    archive_dir.mkdir(exist_ok=True)
 
-    moved = 0
-    for item in desktop.iterdir():
-        if item.is_dir() or item.name.startswith("."):
-            continue
-        if item.suffix.lower() in skip_exts:
-            continue
-        new_path = archive_dir / item.name
-        if not new_path.exists():
-            shutil.move(str(item), str(new_path))
-            moved += 1
+    try:
+        archive_dir.mkdir(exist_ok=True)
+    except OSError as e:
+        return f"Could not create archive folder: {e}"
 
-    return f"Desktop cleaned: {moved} files archived to '{archive_dir.name}'."
+    try:
+        entries = list(desktop.iterdir())
+    except PermissionError:
+        return f"Permission denied: {desktop}"
+
+    moved, failed = 0, []
+    for item in entries:
+        try:
+            if item.is_dir() or item.name.startswith("."):
+                continue
+            if item.suffix.lower() in skip_exts:
+                continue
+            new_path = archive_dir / item.name
+            if not new_path.exists():
+                shutil.move(str(item), str(new_path))
+                moved += 1
+        except Exception as item_exc:
+            failed.append(f"{item.name}: {item_exc}")
+            continue
+
+    result = f"Desktop cleaned: {moved} files archived to '{archive_dir.name}'."
+    if failed:
+        result += f"\n{len(failed)} file(s) could not be archived:\n" + "\n".join(failed[:5])
+        if len(failed) > 5:
+            result += f"\n... and {len(failed) - 5} more failures."
+    return result
 
 
 def get_desktop_stats() -> str:
-    desktop    = _get_desktop()
-    files      = [i for i in desktop.iterdir() if i.is_file()]
-    folders    = [i for i in desktop.iterdir() if i.is_dir()]
-    total_size = sum(f.stat().st_size for f in files if f.exists())
-    size_str   = (
+    desktop = _get_desktop()
+    try:
+        entries = list(desktop.iterdir())
+    except PermissionError:
+        return f"Permission denied: {desktop}"
+
+    files, folders = [], []
+    for i in entries:
+        try:
+            if i.is_dir():
+                folders.append(i)
+            else:
+                files.append(i)
+        except OSError:
+            continue
+
+    total_size = 0
+    for f in files:
+        try:
+            total_size += f.stat().st_size
+        except OSError:
+            continue
+
+    size_str = (
         f"{total_size / 1024:.1f} KB" if total_size < 1024 * 1024
         else f"{total_size / 1024 / 1024:.1f} MB"
     )

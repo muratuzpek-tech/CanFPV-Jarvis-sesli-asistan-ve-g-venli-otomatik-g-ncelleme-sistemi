@@ -4,6 +4,7 @@ from threading import Lock
 from pathlib import Path
 import sys
 from jarvis.paths import memory_dir
+from jarvis.memory.sanitizer import sanitize
 
 
 def get_base_dir() -> Path:
@@ -100,7 +101,8 @@ def _recursive_update(target: dict, updates: dict) -> bool:
             if _recursive_update(target[key], value):
                 changed = True
         else:
-            new_val  = _truncate_value(str(value["value"] if isinstance(value, dict) else value))
+            raw_val  = str(value["value"] if isinstance(value, dict) else value)
+            new_val  = _truncate_value(sanitize(raw_val))
             entry    = {"value": new_val, "updated": datetime.now().strftime("%Y-%m-%d")}
             existing = target.get(key, {})
             if not isinstance(existing, dict) or existing.get("value") != new_val:

@@ -336,6 +336,54 @@ class BrainOrchestrator:
 
     # ── Adım çalıştırma yardımcıları ─────────────────────────────────────
 
+    def _infer_from_structured_parameters(self, parameters, description, base_path=".", forced_action=None):
+        # Planner capability alanini doldurmasa bile, LLM kendi
+        # inisiyatifiyle kullanisli parametreler uretmis olabilir (canli
+        # testte gozlemlendi: capability bos, ama parameters =
+        # {"target": "Desktop/x.txt", "content": "..."}). Bu veri varsa,
+        # zayif metin-tahminine DUSMEDEN once DOGRUDAN kullanilir.
+        if not isinstance(parameters, dict) or not parameters:
+            return None
+        raw_target = (parameters.get("target") or parameters.get("path")
+                      or parameters.get("file") or parameters.get("filename")
+                      or parameters.get("file_name") or parameters.get("name") or "")
+        raw_target = str(raw_target).strip()
+        if not raw_target:
+            return None
+        content = parameters.get("content", "")
+        if not isinstance(content, str):
+            return None
+        norm = raw_target.strip("/")
+        parts = [p for p in norm.split("/") if p]
+        name = parts[-1] if parts else ""
+        if not name or "." not in name:
+            return None
+        if len(parts) > 1:
+            path = "/".join(parts[:-1])
+        else:
+            # DUZELTME (canli testte bulundu, 2026-09-22): planner sadece
+            # dosya adi verip (ornegin "file_name": "x.txt") konum HIC
+            # belirtmezse, duz "." varsayilanina dusmek yerine aciklama
+            # metninde "masaustu/indirilenler/belgeler" gibi bilinen bir
+            # konum var mi diye main.py'nin ZATEN test edilmis
+            # match_file_modification() fonksiyonuyla kontrol ediyoruz -
+            # ayni konum-tespit mantigini burada TEKRAR YAZMAK yerine.
+            path = base_path
+            try:
+                from jarvis.actions.intent_router import match_file_modification
+                loc_hint = match_file_modification(description)
+                if loc_hint and loc_hint.get("path") and loc_hint.get("path") != ".":
+                    path = loc_hint["path"]
+            except Exception:
+                pass
+        if forced_action:
+            action = forced_action
+        else:
+            d = description.lower()
+            is_create = any(k in d for k in ("oluştur", "yarat", "create")) or not d
+            action = "create_file" if is_create else "write"
+        return "file_controller", {"action": action, "path": path or base_path, "name": name, "content": content}
+
     def _infer_executor_action(self, description: str, base_path: str = ".") -> tuple[str, dict]:
         # DÜZELTME (kullanici onayli, 2026-09-16, "path-context" - E2E test
         # sirasinda bulundu): bu fonksiyon ONCEDEN HER ZAMAN "path": "."
@@ -356,6 +404,31 @@ class BrainOrchestrator:
             return "backup_rollback", {}
         if "github" in d:
             return "github_search", {"query": description}
+
+        # YENI DUZELTME (canli testte bulundu - "X yerine Y yaz" gorevi):
+        # asagidaki tirnak-tabanli isim/icerik cikarimi, tirnak icindeki
+        # HERHANGI bir metni (bir kod satirindaki string literal bile olsa)
+        # korukorune dosya adi saniyordu. "'X' yerine 'Y'" KESIN kalibi
+        # bulunursa, bunu bir bul-degistir islemi olarak ele al.
+        def _extract_replace_pair(desc: str):
+            m = re.search(r'''['"]([^'"]+)['"][^'"]*?yerine[^'"]*?['"]([^'"]+)['"]''', desc, re.IGNORECASE)
+            return (m.group(1), m.group(2)) if m else None
+
+        def _extract_target_filename(desc: str):
+            without_quotes = re.sub(r'''['"][^'"]*['"]''', " ", desc)
+            m = re.search(r"\b(\S+?\.[A-Za-z0-9]{1,10})\b", without_quotes)
+            return m.group(1).strip() if m else None
+
+        replace_pair = _extract_replace_pair(description)
+        if replace_pair is not None:
+            old_text, new_text = replace_pair
+            filename = _extract_target_filename(description)
+            if filename:
+                return "file_controller", {
+                    "action": "find_replace", "path": base_path, "name": filename,
+                    "old_text": old_text, "new_text": new_text,
+                }
+            return "file_controller", {"action": "info", "path": base_path}
 
         # DÜZELTME (bkz. dosya başı '_QUOTED_RE' notu): "dosya/klasör
         # oluştur", "...yaz", "...oku" gibi ÇOK YAYGIN executor adımları
@@ -380,6 +453,40 @@ class BrainOrchestrator:
         # sorgusu (hiçbir şeyi asla YARATMAZ/DEĞİŞTİRMEZ/SİLMEZ).
         return "file_controller", {"action": "info", "path": base_path}
 
+    def _resolve_action_with_file_modification(self, task: dict, step: dict, base_path: str = ".") -> tuple[str, dict]:
+        """DUZELTME (canli testte bulundu, 2026-09-22): main.py'nin
+        [FILE_MODIFICATION] deterministik yolu dogru cikardigi action/path/
+        name/content bilgisini task["payload"]["file_modification"]'a
+        koyuyordu ama SADECE _execute_step() bunu okuyordu -
+        _verify_file_action() (auditor'in bagimsiz dosya kontrolu) hala eski,
+        naif _infer_executor_action() ile description'dan TEKRAR tahmin
+        yurutuyordu. Ikisi FARKLI sonuc uretince (gercek dosya DOGRU
+        yazilmis olsa bile), _finish_step()'teki "bagimsiz kanit" mekanizmasi
+        auditor'in dogru "passed=True" kararini YANLIS sekilde
+        "passed=False"a ceviriyordu - yani GERCEK basariyi SAHTE
+        basarisizlik olarak raporluyordu (ilk bulunan "sahte basari"
+        hatasinin aynadaki yansimasi, canli testte brain_test_final.txt ile
+        kanitlandi). Bu fonksiyon TEK bir karar noktasi olarak hem
+        _execute_step hem _verify_file_action tarafindan ORTAK kullanilir,
+        boylece iki yer bir daha ASLA birbirinden sapamaz."""
+        file_mod = task.get("payload", {}).get("file_modification")
+        if (
+            isinstance(file_mod, dict)
+            and file_mod.get("action") in ("create_file", "write")
+            and file_mod.get("name")
+        ):
+            action = "file_controller"
+            params = {
+                "action": file_mod.get("action"),
+                "path": file_mod.get("path") or base_path,
+                "name": file_mod.get("name"),
+                "content": file_mod.get("content", ""),
+            }
+            if file_mod.get("action") == "write":
+                params["append"] = bool(file_mod.get("append", False))
+            return action, params
+        return self._resolve_executor_call(step, base_path)
+
     def _resolve_executor_call(self, step: dict, base_path: str = ".") -> tuple[str, dict]:
         """YENİ mimari (kullanıcı talimatı, Capability Registry + Agent/Tool
         Resolver, 2026-09-16): executor_ai'ye ne çağrılacağını üç katmanlı,
@@ -398,14 +505,44 @@ class BrainOrchestrator:
           3. Hiçbiri eşleşmezse, ESKİ _infer_executor_action() (değişmedi)
              aynen çalışmaya devam eder - legacy görevler bozulmaz."""
         desc = step.get("description", "")
-        if step.get("capability"):
-            resolved = capability_resolver.resolve_structured(
-                step.get("capability"), step.get("tool"), step.get("parameters"))
+        capability = step.get("capability")
+        if capability:
+            tool = step.get("tool")
+            # DUZELTME (canli testte bulundu, 2026-09-22): model capability
+            # alanina GERCEK bir capability adi degil, dogrudan bir
+            # file_controller EYLEM adi (or. "create_file") yazabiliyor -
+            # "tool" alanini da bos birakinca resolve_structured() tool'u
+            # capability ile ayni sayip ("create_file" ALLOWED_TOOLS'ta
+            # olmadigi icin) "Bilinmeyen tool" diye SESSIZCE REJECT
+            # ediyordu - adim history'ye bile yazilmadan gorev "failed"
+            # oluyordu (canli testte brain_test_final4.txt ile kanitlandi,
+            # history=[]). Bilinen, GUVENLI bir file_controller eylem
+            # adiysa ve "tool" ya bos ya da zaten capability/file_controller
+            # ile ayniysa, bunu GERCEK bir capability degil bir
+            # eylem-adi-hatasi olarak ele alip yapilandirilmis
+            # parametrelerle cozuyoruz - genuine bilinmeyen/supheli bir
+            # capability icin REJECT davranisi (asagidaki
+            # resolve_structured cagrisi) DEGISMEDEN kaliyor.
+            _KNOWN_FILE_ACTIONS = {
+                "create_file", "create_folder", "write", "find_replace",
+                "move", "copy", "delete", "find", "list", "info",
+                "disk_usage", "extract",
+            }
+            if capability in _KNOWN_FILE_ACTIONS and (not tool or tool in (capability, "file_controller")):
+                structured = self._infer_from_structured_parameters(
+                    step.get("parameters"), desc, base_path, forced_action=capability)
+                if structured is not None:
+                    return structured
+            resolved = capability_resolver.resolve_structured(capability, tool, step.get("parameters"))
             return resolved["action"], resolved["parameters"]
 
         resolved = capability_resolver.resolve_capability(desc)
         if resolved is not None:
             return resolved["action"], resolved["parameters"]
+
+        structured = self._infer_from_structured_parameters(step.get("parameters"), desc, base_path)
+        if structured is not None:
+            return structured
 
         return self._infer_executor_action(desc, base_path)
 
@@ -557,34 +694,12 @@ class BrainOrchestrator:
             # bu adım o klasörün İÇİNDE çalışsın - eskiden hep "." (düz
             # çalışma dizini) kullanılıyordu.
             base_path = task["payload"].get("_active_folder", ".")
-            # YENİ mimari (2026-09-16): _resolve_executor_call() önce
-            # yapılandırılmış capability/tool, sonra capability_resolver'ın
-            # serbest-metin eşleştirmesi (şu an SADECE windows_system),
-            # hiçbiri eşleşmezse ESKİ _infer_executor_action() fallback'i
-            # dener - bkz. o metodun docstring'i. Yapılandırılmış bir
-            # capability/tool GEÇERSİZSE burada ValueError fırlar; bu,
-            # _tick()'in bu çağrıyı sardığı try/except tarafından yakalanıp
-            # adımı düzgünce failed_steps'e düşürür (TEST 6/7: REJECT).
-            # main.py tarafindan deterministik olarak olusturulan
-            # file_modification bilgisi varsa resolver yerine onu kullan.
-            file_mod = task.get("payload", {}).get("file_modification")
-
-            if (
-                isinstance(file_mod, dict)
-                and file_mod.get("action") in ("create_file", "write")
-                and file_mod.get("name")
-            ):
-                action = "file_controller"
-                params = {
-                    "action": file_mod.get("action"),
-                    "path": file_mod.get("path") or base_path,
-                    "name": file_mod.get("name"),
-                    "content": file_mod.get("content", ""),
-                }
-                if file_mod.get("action") == "write":
-                    params["append"] = bool(file_mod.get("append", False))
-            else:
-                action, params = self._resolve_executor_call(step, base_path)
+            # YENİ mimari (2026-09-16, 2026-09-22 birlestirildi): action/params
+            # karari artik TEK bir ortak metotta (_resolve_action_with_
+            # file_modification) - hem burasi hem _verify_file_action AYNI
+            # sonucu uretir, bir daha birbirinden sapmaz (bkz. o metodun
+            # docstring'i).
+            action, params = self._resolve_action_with_file_modification(task, step, base_path)
 
             # Planner adimi dosya adini tasiyip icerigi tasimamis olabilir.
             # Guvenli geri kazan?m: ayni gorevin goal metninden tekrar cikar.
@@ -610,7 +725,7 @@ class BrainOrchestrator:
 
         raise RuntimeError(f"Bilinmeyen/uygun olmayan beyin: {agent!r}")
 
-    def _verify_file_action(self, step: dict, base_path: str = ".") -> dict | None:
+    def _verify_file_action(self, task: dict, step: dict, base_path: str = ".") -> dict | None:
         """DÜZELTME B (gerçek doğrulama, kullanıcı onaylı): auditor_ai'nin
         "passed" kararı TAMAMEN Gemini'nin metin yargısına dayanıyor -
         dosya sistemini hiç sorgulamıyor (bkz. dosya başı 2026-09-15 notu).
@@ -639,7 +754,7 @@ class BrainOrchestrator:
         if step.get("agent") != "executor_ai":
             return None
         try:
-            action, params = self._infer_executor_action(step.get("description", ""), base_path)
+            action, params = self._resolve_action_with_file_modification(task, step, base_path)
         except Exception:
             return None  # bu güvenlik ağının kendisi ASLA görevi çökertmemeli
         if action != "file_controller":
@@ -649,7 +764,18 @@ class BrainOrchestrator:
         if inner not in ("create_file", "create_folder", "write") or not name:
             return None  # isim çıkarılamadıysa bu kontrol atlanır - eski davranış (info) zaten korunuyor
 
-        target = Path(params.get("path", ".")) / name
+        # DUZELTME (canli testte bulundu, 2026-09-22): duz "Path(path)/name"
+        # birlestirmesi file_controller'in "desktop"/"downloads"/"documents"
+        # gibi KISAYOLLARINI hic taniamiyordu - path="desktop" oldugunda
+        # CALISMA DIZINI icinde var olmayan bir "desktop/" klasorune
+        # bakiyordu, gercek ~/Desktop yerine. Sonuc: dosya GERCEKTEN dogru
+        # icerikle yazilmis olsa bile bu bagimsiz kontrol "diskte
+        # bulunamadi" diyip GERCEK basariyi sahte basarisizliga
+        # ceviriyordu. file_controller'in KENDI yol cozumleyicisini
+        # kullanarak ayni kisayollari (desktop/downloads/documents/...)
+        # dogru sekilde gercek klasore cevirir.
+        from jarvis.actions.file_controller import _resolve_path as _fc_resolve_path
+        target = _fc_resolve_path(params.get("path", ".")) / name
         evidence: dict = {"path": str(target), "exists": False, "content_matches": None, "error": None}
         try:
             if inner == "create_folder":
@@ -717,7 +843,7 @@ class BrainOrchestrator:
         # kapsam DIŞINDAYSA (file_evidence is None - research_ai/coder_ai
         # veya file_controller'ın info/list/read gibi eylemleri) davranış
         # HİÇ DEĞİŞMEDİ, tamamen auditor'ın kendi kararı geçerli.
-        file_evidence = self._verify_file_action(step, active_folder)
+        file_evidence = self._verify_file_action(task, step, active_folder)
 
         if any(p in result_text for p in _NO_RESULT_PATTERNS):
             passed = False

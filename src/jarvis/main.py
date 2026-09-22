@@ -424,7 +424,7 @@ TOOL_DECLARATIONS = [
             "type": "OBJECT",
             "properties": {
                 "action":       {"type": "STRING", "description": "list | create_file | create_folder | delete | delete_all_files | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | extract"},
-                "path":         {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
+                "path":         {"type": "STRING", "description": "A shortcut (desktop, downloads, documents, pictures, music, videos, home) OR an absolute path (e.g. /root, /etc, C:\\Program Files) when the user names a specific system location. All operations are restricted to the user's home directory for safety — an absolute path outside it is denied with 'Access denied', so don't retry it a different way."},
                 "destination":  {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":     {"type": "STRING", "description": "New name for rename"},
                 "content":      {"type": "STRING", "description": "Content for create_file/write"},
@@ -503,6 +503,7 @@ TOOL_DECLARATIONS = [
                 "code":        {"type": "STRING", "description": "Raw code string for explain"},
                 "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
+                "confirm_code": {"type": "STRING", "description": "Required to overwrite an EXISTING file with edit/optimize. The first call (no confirm_code) never writes anything and instead returns a preview plus a short code; call again with the SAME parameters and this code ONLY after the user has explicitly confirmed. Leave empty on the first attempt or when writing a brand-new file."},
             },
             "required": ["action"]
         }
@@ -1577,6 +1578,10 @@ class JarvisLive:
                 peak = int(_np.abs(indata).max()) if indata.size else 0
                 bar = "█" * min(50, peak // 200)
                 print(f"[JARVIS] 🎚️ Mikrofon seviyesi: {peak:5d} {bar}")
+                try:
+                    self.ui.set_voice_volume(min(1.0, peak / 6000.0))
+                except Exception:
+                    pass
 
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
@@ -1715,6 +1720,10 @@ class JarvisLive:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
                                 out_buf.append(txt)
+                                try:
+                                    self.ui.set_voice_transcript(txt)
+                                except Exception:
+                                    pass
 
                         # LIVE_DIAG: Gemini Live response icinden transcript sinyalini izle.
                         try:
@@ -1732,6 +1741,11 @@ class JarvisLive:
                             if txt:
 
                                 in_buf.append(txt)
+                                try:
+                                    self.ui.set_voice_state("USER_SPEAKING", "Canlı ses alınıyor")
+                                    self.ui.set_voice_transcript(txt)
+                                except Exception:
+                                    pass
 
                                 self._last_user_speech = time.monotonic()
 

@@ -176,7 +176,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
                           "done/delete/prioritize: 'task_id' (listedeki sıra no) zorunlu; prioritize ayrıca 'priority' ister. "
                           "list: opsiyonel 'filter' (arama kelimesi), 'all' (true ise tamamlananlar da gösterilir). "
                           "Örnek — 'sütü al'ı listeye eklemek için: action='add', task='sütü al'.",
-    "file_controller":   "action: list|create_file|create_folder|delete|move|copy|find|disk_usage|info|extract; path (ör. 'desktop'); name; content (create_file icin); destination (extract icin opsiyonel)",
+    "file_controller":   "action: list|create_file|create_folder|delete|move|copy|find|disk_usage|info|extract|write|find_replace; path (ör. 'desktop'); name; content (create_file/write icin, TUM dosya icerigini bu yazar); old_text VE new_text (SADECE find_replace icin, ikisi de ZORUNLU - dosyadaki old_text'i new_text ile degistirir). Var olan bir dosyanin SADECE bir kismini degistirmek icin 'write' DEGIL 'find_replace' kullan (write butun dosyayi siler ve bastan yazar, find_replace sadece eslesen metni degistirir, cok daha guvenlidir).",
     "reminder":          "date: YYYY-MM-DD; time: HH:MM; message",
     "web_search":        "query: string; mode: 'search'|'news'|'research'|'price' (opsiyonel)",
     "weather_report":    "city: string",
@@ -194,7 +194,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 # dogrudan calistirmaz, once kullaniciya sorar.
 _DESTRUCTIVE_FILE_ACTIONS = {
     "create_file", "create_folder", "delete", "delete_all_files",
-    "move", "copy", "rename", "write", "organize_desktop", "extract",
+    "move", "copy", "rename", "write", "find_replace", "organize_desktop", "extract",
 }
 _DESTRUCTIVE_SETTINGS_ACTIONS = {"shutdown", "restart", "lock_screen", "lock"}
 

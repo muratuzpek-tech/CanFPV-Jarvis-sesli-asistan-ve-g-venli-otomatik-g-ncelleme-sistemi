@@ -1074,6 +1074,7 @@ class RemoteKeyOverlay(QWidget):
     """Floating overlay — QR code for instant phone pairing + manual key fallback."""
 
     closed = pyqtSignal()
+    _connected_sig = pyqtSignal()
 
     _OW, _OH = 400, 465
 
@@ -1196,6 +1197,10 @@ class RemoteKeyOverlay(QWidget):
         self._ctimer = QTimer(self)
         self._ctimer.timeout.connect(self._tick)
         self._ctimer.start(1000)
+        # Dashboard callbacks run on the asyncio thread.  Never mutate Qt
+        # widgets from that thread; queued signal delivery keeps the overlay
+        # state consistent when the window is closing at the same time.
+        self._connected_sig.connect(self._apply_connected)
         self._tick()
 
     def set_new_key_callback(self, fn) -> None:
@@ -1245,7 +1250,11 @@ class RemoteKeyOverlay(QWidget):
             self._do_close()
 
     def mark_connected(self) -> None:
-        """Call from any thread when a phone successfully connects."""
+        """Thread-safe entry point called when a phone successfully connects."""
+        self._connected_sig.emit()
+
+    def _apply_connected(self) -> None:
+        """Update the overlay on the Qt GUI thread only."""
         self._ctimer.stop()
         self._key_lbl.setText("BAĞLANDI")
         self._key_lbl.setStyleSheet(f"""
@@ -1359,9 +1368,102 @@ class WaveformWidget(QWidget):
         p.drawText(QRectF(34, h - 16, max(160, w - 68), 14), "Canlı yanıt akışı" if self._active else "Backend yanıtı bekleniyor")
 
 
+class VoiceHudWidget(QWidget):
+    """Compact PyQt6 adaptation of the imported voice-assistant state HUD.
+
+    It intentionally stays in the JARVIS Qt process so Tkinter and a second
+    multiprocessing GUI event loop are not introduced into the production UI.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._state = "LISTENING"
+        self._detail = "Dinliyor"
+        self._transcript = ""
+        self._volume = 0.0
+        self._phase = 0.0
+        self.setMinimumWidth(238)
+        self.setFixedHeight(42)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate)
+        self._timer.start(40)
+
+    def set_state(self, state: str, detail: str = ""):
+        self._state = str(state or "ERROR").upper()
+        if detail:
+            self._detail = str(detail)
+        self.update()
+
+    def set_transcript(self, text: str):
+        self._transcript = str(text or "")[-46:]
+        self.update()
+
+    def set_volume(self, value: float):
+        try:
+            self._volume = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            self._volume = 0.0
+        self.update()
+
+    def _animate(self):
+        if self._state in {"USER_SPEAKING", "SPEAKING", "THINKING"}:
+            self._phase += 0.18
+            self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        p.setPen(QPen(qcol(C.BORDER_B), 1))
+        p.setBrush(QBrush(qcol(C.PANEL2)))
+        p.drawRoundedRect(rect, 12, 12)
+
+        colors = {
+            "LISTENING": C.GREEN,
+            "USER_SPEAKING": C.PRI,
+            "SPEAKING": C.ACC2,
+            "THINKING": C.ACC2,
+            "SLEEPING": C.TEXT_DIM,
+            "MUTED": C.MUTED_C,
+            "ERROR": C.RED,
+        }
+        color = colors.get(self._state, C.PRI)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(qcol(color)))
+        p.drawEllipse(QRectF(12, 16, 8, 8))
+
+        title = {
+            "LISTENING": "DİNLİYOR",
+            "USER_SPEAKING": "KONUŞUYORSUNUZ",
+            "SPEAKING": "JARVIS KONUŞUYOR",
+            "THINKING": "DÜŞÜNÜYOR",
+            "SLEEPING": "UYKU MODU",
+            "MUTED": "MİKROFON KAPALI",
+            "ERROR": "SES HATASI",
+        }.get(self._state, self._state)
+        p.setPen(QPen(qcol(C.WHITE), 1))
+        p.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        p.drawText(QRectF(27, 6, 104, 14), Qt.AlignmentFlag.AlignLeft, title)
+
+        detail = self._transcript if self._transcript and self._state in {"USER_SPEAKING", "SPEAKING"} else self._detail
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.setFont(QFont("Segoe UI", 7))
+        p.drawText(QRectF(27, 21, 112, 13), Qt.AlignmentFlag.AlignLeft, detail[:24])
+
+        mid = self.height() / 2
+        for i in range(10):
+            x = 151 + i * 7
+            amp = 3 + 11 * max(self._volume, 0.18) * (0.45 + 0.55 * abs(math.sin(self._phase + i * 0.7)))
+            p.setPen(QPen(qcol(C.PRI if i % 2 == 0 else C.ACC2), 2))
+            p.drawLine(QPointF(x, mid - amp), QPointF(x, mid + amp))
+
+
 class MainWindow(QMainWindow):
     _log_sig     = pyqtSignal(str)
     _state_sig   = pyqtSignal(str)
+    _voice_state_sig = pyqtSignal(str, str)
+    _voice_transcript_sig = pyqtSignal(str)
+    _voice_volume_sig = pyqtSignal(float)
     _content_sig = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig = pyqtSignal()          # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)   # show camera frame preview (small overlay)
@@ -1478,6 +1580,9 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._on_log)
         self._state_sig.connect(self._apply_state)
+        self._voice_state_sig.connect(self._apply_voice_state)
+        self._voice_transcript_sig.connect(self._apply_voice_transcript)
+        self._voice_volume_sig.connect(self._apply_voice_volume)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -1504,6 +1609,8 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+        sc_remote = QShortcut(QKeySequence("F6"), self)
+        sc_remote.activated.connect(self._open_remote)
 
     def _pill(self, text: str, color: str = C.PRI) -> QLabel:
         w = QLabel(text); w.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1519,8 +1626,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(icon)
         title = QLabel("Canlı Sohbet"); title.setFont(QFont("Segoe UI", 13, QFont.Weight.DemiBold)); title.setStyleSheet(f"color:{C.WHITE}; background:transparent;")
         lay.addWidget(title)
-        meta = QLabel("Backend bağlantısı bekleniyor · görev verisi yok"); meta.setFont(QFont("Segoe UI", 8)); meta.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none;"); lay.addWidget(meta)
+        meta = QLabel("Backend bağlantısı bekleniyor · görev verisi yok")
+        self._chat_meta_lbl = meta
+        meta.setFont(QFont("Segoe UI", 8)); meta.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none;"); lay.addWidget(meta)
         lay.addStretch()
+        self._voice_hud = VoiceHudWidget()
+        lay.addWidget(self._voice_hud)
         self._center_state_lbl = self._pill("●  Dinleniyor…")
         lay.addWidget(self._center_state_lbl)
         return bar
@@ -1547,23 +1658,23 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_task_flow(self):
-        card = QFrame(); card.setObjectName("TaskFlow"); card.setFixedHeight(142); card.setStyleSheet(f"QFrame#TaskFlow {{ background:{C.PANEL}; border:1px solid {C.BORDER}; border-radius:10px; }}")
-        v = QVBoxLayout(card); v.setContentsMargins(16, 10, 16, 8); v.setSpacing(6); top = QHBoxLayout()
+        card = QFrame(); card.setObjectName("TaskFlow"); card.setFixedHeight(174); card.setStyleSheet(f"QFrame#TaskFlow {{ background:{C.PANEL}; border:1px solid {C.BORDER}; border-radius:10px; }}")
+        v = QVBoxLayout(card); v.setContentsMargins(16, 10, 16, 9); v.setSpacing(7); top = QHBoxLayout()
         title = QLabel("☷  Görev Yürütme Akışı"); title.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold)); title.setStyleSheet(f"color:{C.WHITE}; background:transparent; border:none;"); top.addWidget(title); top.addStretch()
         self._task_status_lbl = QLabel("Görev yok — hazır"); self._task_status_lbl.setFont(QFont("Segoe UI", 8)); self._task_status_lbl.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none;"); top.addWidget(self._task_status_lbl); v.addLayout(top)
-        stages = QHBoxLayout(); stages.setSpacing(0); self._task_stage_nodes = {}
+        stages = QHBoxLayout(); stages.setSpacing(0); stages.setAlignment(Qt.AlignmentFlag.AlignVCenter); self._task_stage_nodes = {}
         for idx, (name, desc) in enumerate((("Planner", "Plan hazırla"), ("Research", "Veri tara"), ("Security", "Güvenliği kontrol et"), ("Auditor", "Son denetim"))):
-            node = QVBoxLayout(); node.setSpacing(2)
+            node = QVBoxLayout(); node.setSpacing(3); node.setContentsMargins(0, 0, 0, 0)
             circle = QLabel(str(idx + 1)); circle.setFixedSize(26, 26); circle.setAlignment(Qt.AlignmentFlag.AlignCenter)
             circle.setStyleSheet(f"color:{C.TEXT_DIM}; background:{C.DARK}; border:1px solid {C.BORDER}; border-radius:13px;")
-            label = QLabel(name); label.setAlignment(Qt.AlignmentFlag.AlignCenter); label.setStyleSheet(f"color:{C.TEXT_MED}; background:transparent; border:none;")
-            detail = QLabel(desc); detail.setAlignment(Qt.AlignmentFlag.AlignCenter); detail.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none; font-size:8px;")
+            label = QLabel(name); label.setAlignment(Qt.AlignmentFlag.AlignCenter); label.setFixedHeight(15); label.setStyleSheet(f"color:{C.TEXT_MED}; background:transparent; border:none;")
+            detail = QLabel(desc); detail.setAlignment(Qt.AlignmentFlag.AlignCenter); detail.setFixedHeight(13); detail.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none; font-size:8px;")
             node.addWidget(circle, alignment=Qt.AlignmentFlag.AlignCenter); node.addWidget(label); node.addWidget(detail)
             cell = QWidget(); cell.setLayout(node); stages.addWidget(cell, stretch=1); self._task_stage_nodes[name] = circle
             if idx < 3:
                 line = QFrame(); line.setFrameShape(QFrame.Shape.HLine); line.setFixedWidth(35); line.setStyleSheet(f"color:{C.BORDER}; background:{C.BORDER}; border:none;"); stages.addWidget(line, alignment=Qt.AlignmentFlag.AlignCenter)
         v.addLayout(stages)
-        self._task_detail_lbl = QLabel("Yeni dosya veya komut gönderildiğinde görev akışı burada gösterilir."); self._task_detail_lbl.setFont(QFont("Segoe UI", 8)); self._task_detail_lbl.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none;"); v.addWidget(self._task_detail_lbl)
+        self._task_detail_lbl = QLabel("Yeni dosya veya komut gönderildiğinde görev akışı burada gösterilir."); self._task_detail_lbl.setFont(QFont("Segoe UI", 8)); self._task_detail_lbl.setMinimumHeight(18); self._task_detail_lbl.setMaximumHeight(22); self._task_detail_lbl.setStyleSheet(f"color:{C.TEXT_DIM}; background:transparent; border:none;"); v.addWidget(self._task_detail_lbl)
         return card
 
     def _set_task_stages(self, active: str | None = None, completed: tuple[str, ...] = ()):
@@ -1659,15 +1770,36 @@ class MainWindow(QMainWindow):
         return page
 
     def _read_task_files(self) -> list[dict]:
-        tasks: list[dict] = []
+        by_id: dict[str, dict] = {}
+        anonymous: list[dict] = []
         for path in (memory_dir() / "agent_tasks.json", tasks_dir() / "brain_tasks.json"):
             try:
                 data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
                 if isinstance(data, list):
-                    tasks.extend(item for item in data if isinstance(item, dict))
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        task_id = str(item.get("id", "")).strip()
+                        if task_id:
+                            previous = by_id.get(task_id)
+                            if previous is None or str(item.get("updated_at", item.get("created_at", ""))) >= str(previous.get("updated_at", previous.get("created_at", ""))):
+                                by_id[task_id] = item
+                        else:
+                            anonymous.append(item)
             except Exception as exc:
-                self._log_sig.emit(f"SYS: Görev kaydı okunamadı: {exc}")
-        return sorted(tasks, key=lambda item: str(item.get("created_at", "")), reverse=True)
+                # Do not emit this every 1.5 s: a transient half-written JSON
+                # file would otherwise flood the activity feed and make the
+                # UI look as if old events were replaying.
+                if not getattr(self, "_task_read_error", False):
+                    self._task_read_error = True
+                    self._log_sig.emit(f"SYS: Görev kaydı okunamadı: {exc}")
+        self._task_read_error = False
+        tasks = list(by_id.values()) + anonymous
+        return sorted(
+            tasks,
+            key=lambda item: str(item.get("updated_at", item.get("created_at", ""))),
+            reverse=True,
+        )
 
     def _refresh_task_center(self):
         if not hasattr(self, "_task_status_lbl"):
@@ -1682,13 +1814,33 @@ class MainWindow(QMainWindow):
             goal = str(active.get("goal", active.get("name", "Görev")))
             self._task_status_lbl.setText(f"{status_text} · {active.get('id', '—')}")
             self._task_detail_lbl.setText(goal[:150])
+            if status == "pending":
+                self._set_task_stages("Planner", ())
+            elif status == "running":
+                self._set_task_stages("Research", ("Planner",))
+            else:
+                self._set_task_stages("Security", ("Planner", "Research"))
         elif tasks:
             latest = tasks[0]
-            self._task_status_lbl.setText(f"Son görev · {latest.get('status', 'bilinmiyor')}")
+            latest_status = str(latest.get("status", "bilinmiyor"))
+            status_text = {
+                "completed": "Tamamlandı",
+                "done": "Tamamlandı",
+                "failed": "Başarısız",
+                "cancelled": "İptal edildi",
+            }.get(latest_status, latest_status)
+            self._task_status_lbl.setText(f"Son görev · {status_text}")
             self._task_detail_lbl.setText(str(latest.get("goal", latest.get("name", "Görev")))[:150])
+            if latest_status in ("completed", "done"):
+                self._set_task_stages(None, ("Planner", "Research", "Security", "Auditor"))
+            elif latest_status == "failed":
+                self._set_task_stages("Auditor", ("Planner", "Research", "Security"))
+            else:
+                self._set_task_stages(None, ())
         else:
             self._task_status_lbl.setText("Görev yok — hazır")
             self._task_detail_lbl.setText("Yeni görev verdiğinizde durum burada canlı gösterilir.")
+            self._set_task_stages(None, ())
         if hasattr(self, "_tasks_summary"):
             self._tasks_summary.setPlainText(self._format_task_summary(tasks, counts))
         if hasattr(self, "_team_summary"):
@@ -2231,6 +2383,7 @@ class MainWindow(QMainWindow):
         center.setSpacing(1)
 
         main = QLabel("●  Bağlantı doğrulanmadı")
+        self._header_state_lbl = main
         main.setFont(
             QFont("Segoe UI", 10, QFont.Weight.DemiBold)
         )
@@ -2564,19 +2717,14 @@ class MainWindow(QMainWindow):
 
     def _on_log(self, text: str):
         self._log.append_log(text)
-        self._refresh_task_center()
-        upper = str(text).upper()
-        if "FILE_ANALYSIS" in upper or "DOSYA ANALİZ" in upper:
-            self._task_status_lbl.setText("Görev yürütülüyor · Dosya analizi")
-            self._set_task_stages("Research", ("Planner",))
-            self._task_detail_lbl.setText("Research aşaması: dosya içeriği analiz ediliyor")
-        elif "TASK" in upper and any(word in upper for word in ("DONE", "COMPLETED", "TAMAMLANDI")):
-            self._task_status_lbl.setText("Görev tamamlandı")
-            self._set_task_stages(None, ("Planner", "Research", "Security", "Auditor"))
-            self._task_detail_lbl.setText("Özet ve aksiyon maddeleri hazır")
+        # Task flow is driven only by the persisted task records in
+        # _refresh_task_center.  Log heuristics used to overwrite a newer
+        # state with an older FILE_ANALYSIS/TASK message.
         if text.lower().startswith(("you:", "jarvis:")):
             speaker = "JARVIS" if text.lower().startswith("jarvis:") else "Sen"
             body = text.split(":", 1)[1].strip() if ":" in text else text
+            if not body:
+                return
             self._chat_empty_lbl.hide()
             self._chat_messages_layout.addWidget(self._bubble(speaker, body, speaker == "JARVIS"))
 
@@ -2610,10 +2758,15 @@ class MainWindow(QMainWindow):
 
     def _on_file_selected(self, path: str):
         self._current_file = path
-        p    = Path(path)
+        p = Path(path)
         cat  = _file_category(p)
         icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
-        size = _fmt_size(p.stat().st_size)
+        try:
+            size = _fmt_size(p.stat().st_size)
+        except (OSError, ValueError) as exc:
+            self._file_hint.setText(f"⚠  Dosya okunamadı: {p.name}")
+            self._log_sig.emit(f"SYS: Dosya bilgisi okunamadı: {exc}")
+            return
         self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell JARVIS what to do with it")
         self._task_status_lbl.setText("Görev hazır · Dosya analizi bekleniyor")
         self._set_task_stages("Planner")
@@ -2708,8 +2861,28 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_waveform"): self._waveform.set_active(state == "SPEAKING")
         labels = {"CONNECTING":"◌  Bağlanıyor", "AUTH_REQUIRED":"⚠  Kimlik doğrulama gerekli", "ERROR":"⚠  Hata", "LISTENING":"●  Dinliyor", "SPEAKING":"◉  Yanıt veriyor", "SLEEPING":"○  Beklemede", "MUTED":"◌  Mikrofon sessiz"}
         text = labels.get(state, f"●  {state.title()}")
+        voice_state = {
+            "SPEAKING": ("SPEAKING", "Yanıt seslendiriliyor"),
+            "THINKING": ("THINKING", "Agent Loop çalışıyor"),
+            "LISTENING": ("LISTENING", "Mikrofon hazır"),
+            "SLEEPING": ("SLEEPING", "Bekleme modu"),
+            "MUTED": ("MUTED", "Mikrofon kapalı"),
+            "ERROR": ("ERROR", "Ses bağlantısı kontrol edilmeli"),
+        }.get(state, ("LISTENING", "Yerel UI hazır"))
+        if hasattr(self, "_voice_hud"):
+            self._voice_hud.set_state(*voice_state)
         if hasattr(self, "_center_state_lbl"): self._center_state_lbl.setText(text)
+        if hasattr(self, "_header_state_lbl"): self._header_state_lbl.setText(text)
         if hasattr(self, "_online_lbl"): self._online_lbl.setText(f"● {text}")
+        if hasattr(self, "_chat_meta_lbl"):
+            if state in {"LISTENING", "SPEAKING", "THINKING"}:
+                self._chat_meta_lbl.setText("Backend bağlı · görev verisi canlı")
+            elif state == "AUTH_REQUIRED":
+                self._chat_meta_lbl.setText("Backend kimlik doğrulaması bekleniyor")
+            elif state == "CONNECTING":
+                self._chat_meta_lbl.setText("Backend bağlantısı kuruluyor…")
+            else:
+                self._chat_meta_lbl.setText("Backend bağlantısı bekleniyor")
         if hasattr(self, "_connection_detail_lbl"): self._connection_detail_lbl.setText("Backend bağlantısı doğrulandı" if state not in {"CONNECTING", "AUTH_REQUIRED", "ERROR"} else "Backend bağlantısı bekleniyor")
         if hasattr(self, "_internet_lbl"):
             online = state not in {"CONNECTING", "AUTH_REQUIRED", "ERROR"}
@@ -2720,6 +2893,18 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_health_lbl"):
             color = C.MUTED_C if state == "MUTED" else (C.RED if state == "ERROR" else (C.PRI if state in {"CONNECTING", "AUTH_REQUIRED"} else C.GREEN))
             self._health_lbl.setText(f"{text}   ·   UI yerel"); self._health_lbl.setStyleSheet(f"color:{color}; background:#071c32; border:1px solid {C.BORDER}; border-radius:9px; padding-left:10px;")
+
+    def _apply_voice_state(self, state: str, detail: str):
+        if hasattr(self, "_voice_hud"):
+            self._voice_hud.set_state(state, detail)
+
+    def _apply_voice_transcript(self, text: str):
+        if hasattr(self, "_voice_hud"):
+            self._voice_hud.set_transcript(text)
+
+    def _apply_voice_volume(self, value: float):
+        if hasattr(self, "_voice_hud"):
+            self._voice_hud.set_volume(value)
 
     def _on_mic_device(self, name: str):
         self._mic_lbl.setText(f"🎤 {name}")
@@ -2775,13 +2960,17 @@ class MainWindow(QMainWindow):
         self.stop_camera_stream()
         self._clock_tmr.stop()
         self._metric_tmr.stop()
+        self._task_tmr.stop()
         self._cam_preview._timer.stop()
         self._drop_zone._anim_tmr.stop()
         self._log._tmr.stop()
         self.hud._tmr.stop()
         self._waveform.stop()
+        self._voice_hud._timer.stop()
         if self._overlay: self._overlay.hide()
         if self._remote_overlay: self._remote_overlay._do_close()
+        if self._cam_thread and self._cam_thread.is_alive():
+            self._cam_thread.join(timeout=0.5)
         global _metrics
         if _metrics is not None: _metrics.stop()
         super().closeEvent(event)
@@ -2845,6 +3034,21 @@ class JarvisUI:
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
+
+    def set_voice_state(self, state: str, detail: str = ""):
+        """Thread-safe update for the compact Voice Assistant HUD."""
+        self._win._voice_state_sig.emit(str(state), str(detail))
+
+    def set_voice_transcript(self, text: str):
+        """Thread-safe partial transcript update for the compact HUD."""
+        self._win._voice_transcript_sig.emit(str(text or ""))
+
+    def set_voice_volume(self, value: float):
+        """Thread-safe normalized RMS update for the compact HUD."""
+        try:
+            self._win._voice_volume_sig.emit(float(value))
+        except (TypeError, ValueError):
+            pass
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
