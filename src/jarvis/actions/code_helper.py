@@ -47,7 +47,12 @@ def _get_gemini(model: str = GEMINI_MODEL):
             return _OllamaResponse(resp.json().get("response", ""))
 
     try:
-        _requests.get("http://localhost:11434/api/version", timeout=5)
+        tags_resp = _requests.get("http://localhost:11434/api/tags", timeout=5)
+        tags_resp.raise_for_status()
+        installed = {m.get("name") or m.get("model") for m in tags_resp.json().get("models", [])}
+        if OLLAMA_MODEL not in installed:
+            print(f"[Code] Yerel Ollama çalışıyor ama '{OLLAMA_MODEL}' modeli kurulu değil, Gemini'ye geçiliyor.")
+            raise RuntimeError("ollama model not installed")
         print("[Code] Yerel Ollama kullanılıyor (Gemini'ye bağımlı değil).")
         return _OllamaWrapper()
     except Exception:

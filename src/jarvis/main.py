@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import sys
+import struct
 import traceback
 from urllib.parse import unquote, urlparse
 from datetime import datetime
@@ -61,6 +62,7 @@ from jarvis.actions.audio_devices import (
     device_identity as _audio_device_identity,
     device_name as _audio_device_name,
     get_candidates as _audio_candidates,
+    list_devices as _list_audio_devices,
     resolve_device_index as _resolve_audio_device,
 )
 from jarvis.actions.resilience import CircuitBreaker
@@ -68,6 +70,8 @@ from jarvis.actions.self_improve import self_improve
 from jarvis.actions.agent_loop import agent_loop_tool, start_background_loop as start_agent_loop
 from jarvis.actions.conversation_log import log_turn, recall_conversation
 from jarvis.actions.github_arama import github_search
+from jarvis.actions.discovered_topydo import run as discovered_topydo_run
+from jarvis.actions.discovered_jc import run as discovered_jc_run
 from jarvis.actions.intent_router import match_system_read, match_file_analysis, match_file_modification
 from jarvis.core.secure_config import api_keys_path
 from jarvis.paths import asset
@@ -123,6 +127,19 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+
+
+def _pcm_rms_level(data: bytes, max_expected: float = 9000.0) -> float:
+    """Normalize signed-int16 mono PCM for the Voice Assistant spectrum HUD."""
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+        return 0.0
+    count = len(data) // 2
+    try:
+        samples = struct.unpack(f"<{count}h", data[:count * 2])
+    except struct.error:
+        return 0.0
+    mean_square = sum(sample * sample for sample in samples) / count
+    return max(0.0, min(1.0, (mean_square ** 0.5) / max_expected))
 
 # Art arda basarisiz mikrofon/hoparlor denemelerinde her reconnect'te tum
 # cihaz listesini bastan taramak yerine kisa bir sure hizlica pes eder
@@ -381,9 +398,23 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
+                "action":      {"type": "STRING", "description": (
+                    "volume_up | volume_down | mute | unmute | volume_set (use with value=0-100) | "
+                    "brightness_up | brightness_down | sleep_display | pause_video | close_app | "
+                    "close_window | fullscreen | minimize | maximize | snap_left | snap_right | "
+                    "switch_window | show_desktop | task_manager | focus_search | refresh_page | "
+                    "close_tab | new_tab | next_tab | prev_tab | go_back | go_forward | zoom_in | "
+                    "zoom_out | zoom_reset | find_on_page | scroll_up | scroll_down | scroll_top | "
+                    "scroll_bottom | page_up | page_down | copy | paste | cut | undo | redo | "
+                    "select_all | save | enter | escape | screenshot | lock_screen | open_settings | "
+                    "file_explorer | open_run | dark_mode | toggle_wifi | restart | shutdown | "
+                    "type_text (use with value=text) | press_key (use with value=key name) | "
+                    "reload_n (use with value=integer). For volume, ALWAYS use volume_set with an "
+                    "explicit 0-100 value when the user gives a percentage/level; only use "
+                    "volume_up/volume_down for relative 'louder/quieter' requests."
+                )},
                 "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
+                "value":       {"type": "STRING", "description": "Optional value: volume level 0-100 for volume_set, text to type, etc."}
             },
             "required": []
         }
@@ -424,7 +455,7 @@ TOOL_DECLARATIONS = [
             "type": "OBJECT",
             "properties": {
                 "action":       {"type": "STRING", "description": "list | create_file | create_folder | delete | delete_all_files | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info | extract"},
-                "path":         {"type": "STRING", "description": "A shortcut (desktop, downloads, documents, pictures, music, videos, home) OR an absolute path (e.g. /root, /etc, C:\\Program Files) when the user names a specific system location. All operations are restricted to the user's home directory for safety — an absolute path outside it is denied with 'Access denied', so don't retry it a different way."},
+                "path":         {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination":  {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":     {"type": "STRING", "description": "New name for rename"},
                 "content":      {"type": "STRING", "description": "Content for create_file/write"},
@@ -503,14 +534,13 @@ TOOL_DECLARATIONS = [
                 "code":        {"type": "STRING", "description": "Raw code string for explain"},
                 "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
-                "confirm_code": {"type": "STRING", "description": "Required to overwrite an EXISTING file with edit/optimize. The first call (no confirm_code) never writes anything and instead returns a preview plus a short code; call again with the SAME parameters and this code ONLY after the user has explicitly confirmed. Leave empty on the first attempt or when writing a brand-new file."},
             },
             "required": ["action"]
         }
     },
     {
         "name": "dev_agent",
-        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors.",
+        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors. The first call (no confirm_code) never installs or runs anything, it only returns a preview and a confirm_code. You MUST relay what will be built to the user and wait for their explicit confirmation in their next message before calling 'dev_agent' again with that confirm_code. Never chain both calls in the same turn without a real user confirmation in between.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -518,6 +548,7 @@ TOOL_DECLARATIONS = [
                 "language":     {"type": "STRING", "description": "Programming language (default: python)"},
                 "project_name": {"type": "STRING", "description": "Optional project folder name"},
                 "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
+                "confirm_code": {"type": "STRING", "description": "The code returned by a PRIOR unconfirmed call, after the user has explicitly confirmed. Leave empty on the first attempt."},
             },
             "required": ["description"]
         }
@@ -531,13 +562,18 @@ TOOL_DECLARATIONS = [
             "before keeping it. If verification fails it retries up to 3 times, then restores the "
             "original file automatically. Use this when the user asks Jarvis to improve/refactor "
             "its own code, fix itself, or 'kendini geliştir'. If no file is named, picks the "
-            "actions/ file that hasn't been reviewed the longest."
+            "actions/ file that hasn't been reviewed the longest. The first call (no confirm_code) "
+            "never touches the file, it only returns a preview and a confirm_code. You MUST relay "
+            "which file and goal to the user and wait for their explicit confirmation in their "
+            "next message before calling 'self_improve' again with that confirm_code. Never chain "
+            "both calls in the same turn without a real user confirmation in between."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "file_path": {"type": "STRING", "description": "Optional path (relative to the project root) of the file to improve, e.g. 'actions/weather_report.py'. If omitted, Jarvis picks one itself."},
-                "goal":      {"type": "STRING", "description": "Optional description of what to improve (e.g. 'add better error handling'). Defaults to a general code-quality pass."},
+                "file_path":    {"type": "STRING", "description": "Optional path (relative to the project root) of the file to improve, e.g. 'actions/weather_report.py'. If omitted, Jarvis picks one itself."},
+                "goal":         {"type": "STRING", "description": "Optional description of what to improve (e.g. 'add better error handling'). Defaults to a general code-quality pass."},
+                "confirm_code": {"type": "STRING", "description": "The code returned by a PRIOR unconfirmed call, after the user has explicitly confirmed. Leave empty on the first attempt."},
             },
             "required": []
         }
@@ -581,13 +617,16 @@ TOOL_DECLARATIONS = [
             "Recalls and summarizes past conversation with the user from a real, persisted "
             "conversation log — use this whenever the user asks what was discussed before, "
             "e.g. 'dün ne konuştuk', 'geçen hafta ne demiştim', 'bunu daha önce konuşmuş "
-            "muyduk', 'what did we talk about yesterday'. Never say you don't have access to "
-            "past conversations without calling this tool first."
+            "muyduk', 'what did we talk about yesterday', OR a recent/same-session reference "
+            "like 'demin ne dedin', '10 dakika önce ne konuşmuştuk', 'az önce söyledin ama' — "
+            "for those, use the 'minutes' parameter instead of 'period'. Never say you don't "
+            "have access to past conversations without calling this tool first."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "period": {"type": "STRING", "description": "bugun | dun | bu_hafta | gecen_hafta — use this for relative time references."},
+                "minutes": {"type": "INTEGER", "description": "Use for recent/same-session references ('demin', 'az önce', 'X dakika önce', 'biraz önce'): how many minutes back to search, e.g. 10. Takes priority over period/date when set."},
+                "period": {"type": "STRING", "description": "bugun | dun | bu_hafta | gecen_hafta — use this for day-level relative time references."},
                 "date":   {"type": "STRING", "description": "Optional explicit date in YYYY-MM-DD format instead of period."},
                 "topic":  {"type": "STRING", "description": "Optional — focus the summary on a specific topic if the user mentioned one."},
             },
@@ -613,6 +652,47 @@ TOOL_DECLARATIONS = [
                 "max_results": {"type": "INTEGER", "description": "Optional max number of results (default a small handful)."},
             },
             "required": ["query"]
+        }
+    },
+    {
+        "name": "discovered_topydo",
+        "description": (
+            "Simple to-do / task list tool (todo.txt format) — use whenever the user wants to "
+            "add, list, complete, delete, prioritize, or clear items on a personal to-do list, "
+            "e.g. 'yapılacaklar listeme ekle', 'listeme süt al yaz', 'görevlerimi göster', "
+            "'şu görevi tamamladım', 'listemi temizle', 'to-do list', 'add a task'. This is a "
+            "separate, lightweight list from agent_loop's background task queue — use this one "
+            "for the user's own personal to-do items, not for background automation steps."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":   {"type": "STRING", "description": "add|list|done|delete|prioritize|clear (accepts Turkish synonyms like ekle/listele/bitir/sil/oncelik/temizle too)."},
+                "task":     {"type": "STRING", "description": "The task text (for action=add)."},
+                "priority": {"type": "STRING", "description": "Optional priority letter A-Z (for action=add or action=prioritize)."},
+                "task_id":  {"type": "INTEGER", "description": "The item's list number, as shown by action=list (for action=done/delete/prioritize)."},
+                "filter":   {"type": "STRING", "description": "Optional search/filter text (for action=list)."},
+                "all":      {"type": "BOOLEAN", "description": "If true with action=list, also show already-completed items."},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "discovered_jc",
+        "description": (
+            "Converts the plain-text output of a standard command-line tool (e.g. 'ls', 'ps', "
+            "'df', 'ifconfig', 'netstat') into structured JSON, using the open-source 'jc' "
+            "parser library. Use this ONLY if the user explicitly gives you raw command output "
+            "and asks you to parse/structure it into JSON — this is a low-level utility, not a "
+            "general system-info tool (use system_status or windows_system for that instead)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "command": {"type": "STRING", "description": "The name of the command whose output is being parsed, e.g. 'ls', 'ps', 'df' (jc parser name, hyphens allowed)."},
+                "data":    {"type": "STRING", "description": "The raw text output of that command to parse."},
+            },
+            "required": ["command", "data"]
         }
     },
     {
@@ -1379,6 +1459,22 @@ class JarvisLive:
             elif name == "file_controller":
                 r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
                 result = r or "Done."
+                # Mirror listing/info results to the on-screen content panel.
+                # Sesli yanit genelde "listelendi efendim" gibi ozetleyip
+                # gercek dosya adlarini hic soylemiyor - kullanici bunu fark
+                # etti (2026-09-21). Diger arac sonuclari (web_search) icin
+                # zaten yapilan show_content aynasi burada da yapiliyor ki
+                # gercek icerik (dosya adlari) sesli ozetten bagimsiz olarak
+                # gorunur olsun.
+                _fc_action = str(args.get("action", "")).lower()
+                if r and _fc_action in ("list", "find", "largest", "disk_usage", "info"):
+                    _fc_path = args.get("path", "")
+                    _fc_label = f"FILES — {_fc_action.upper()}" + (f" ({_fc_path})" if _fc_path else "")
+                    self.ui.show_content(_fc_label, r)
+                    # Ayrica log/gecmis paneline de yaz - kullanici sadece
+                    # sesli/ozet yaniti degil, ham listeyi de metin olarak
+                    # (kopyalayip yapistirabilecegi transcript'te) gorsun.
+                    self.ui.write_log(f"[{_fc_label}]\n{r}")
 
             elif name == "task_manager":
                 r = await loop.run_in_executor(None, lambda: task_manager(parameters=args, player=self.ui))
@@ -1474,6 +1570,14 @@ class JarvisLive:
 
             elif name == "github_arama":
                 r = await loop.run_in_executor(None, lambda: github_search(args))
+                result = r or "Done."
+
+            elif name == "discovered_topydo":
+                r = await loop.run_in_executor(None, lambda: discovered_topydo_run(args))
+                result = r or "Done."
+
+            elif name == "discovered_jc":
+                r = await loop.run_in_executor(None, lambda: discovered_jc_run(args))
                 result = r or "Done."
 
             elif name == "web_search":
@@ -1576,10 +1680,11 @@ class JarvisLive:
             if now - _level_state["last_print"] > 2.0:
                 _level_state["last_print"] = now
                 peak = int(_np.abs(indata).max()) if indata.size else 0
+                rms = float(_np.sqrt(_np.mean(_np.square(indata.astype(_np.float32))))) if indata.size else 0.0
                 bar = "█" * min(50, peak // 200)
                 print(f"[JARVIS] 🎚️ Mikrofon seviyesi: {peak:5d} {bar}")
                 try:
-                    self.ui.set_voice_volume(min(1.0, peak / 6000.0))
+                    self.ui.set_voice_volume(min(1.0, rms / 4500.0))
                 except Exception:
                     pass
 
@@ -1638,7 +1743,13 @@ class JarvisLive:
                 await asyncio.sleep(RETRY_DELAY)
                 continue
 
-            candidates = _audio_candidates("input")
+            # TEK bir anlik goruntu: adaylari bulma + kimlik yakalama + dogrulama
+            # AYNI enumerasyon uzerinden yapilir. Bazi Bluetooth Hands-Free
+            # cihazlari ismini sorgular arasinda tutarsiz raporluyor (bkz.
+            # resolve_device_index docstring'i) - ayri sorgular kullanmak bu
+            # cihazlarda mikrofonun hic acilamamasina yol aciyordu.
+            _devices_snapshot = _list_audio_devices()
+            candidates = _audio_candidates("input", devices=_devices_snapshot)
             print(f"[JARVIS] Mikrofon adaylari: {candidates}")
 
             last_err = None
@@ -1646,7 +1757,11 @@ class JarvisLive:
             if not candidates:
                 last_err = RuntimeError("no usable input device")
             for cand in candidates:
-                resolved = _resolve_audio_device("input", _audio_device_identity("input", cand))
+                resolved = _resolve_audio_device(
+                    "input",
+                    _audio_device_identity("input", cand, devices=_devices_snapshot),
+                    devices=_devices_snapshot,
+                )
                 if resolved is None:
                     last_err = RuntimeError("input device changed or is ambiguous")
                     print(f"[JARVIS] ⚠️ Mikrofon adayi yeniden dogrulanamadi (device={cand})")
@@ -1663,7 +1778,7 @@ class JarvisLive:
                         blocksize=CHUNK_SIZE,
                         callback=callback,
                     ):
-                        name = _audio_device_name(resolved)
+                        name = _audio_device_name(resolved, devices=_devices_snapshot)
                         print(f"[JARVIS] 🎤 Mic stream open (device={resolved} - {name})")
                         _mic_breaker.record_success()
                         opened = True
@@ -1889,7 +2004,10 @@ class JarvisLive:
         # Ayni ortak modul (actions/audio_devices.py) - mic ile ayni EXCLUDE
         # listesini ve oncelik sirasini kullanir, health_check.py ile tutarli.
         while True:
-            out_candidates = _audio_candidates("output")
+            # Ayni "tek anlik goruntu" duzeltmesi mikrofon icin de gecerli -
+            # bkz. yukarisi ve resolve_device_index docstring'i.
+            _devices_snapshot = _list_audio_devices()
+            out_candidates = _audio_candidates("output", devices=_devices_snapshot)
             print(f"[JARVIS] Hoparlor adaylari: {out_candidates}")
             stream = None
             last_out_err = None
@@ -1898,7 +2016,11 @@ class JarvisLive:
                 print("[JARVIS] ⏳ Hoparlör devre kesici açık, deneme atlanıyor.")
             else:
                 for cand in out_candidates:
-                    resolved = _resolve_audio_device("output", _audio_device_identity("output", cand))
+                    resolved = _resolve_audio_device(
+                        "output",
+                        _audio_device_identity("output", cand, devices=_devices_snapshot),
+                        devices=_devices_snapshot,
+                    )
                     if resolved is None:
                         last_out_err = RuntimeError("output device changed or is ambiguous")
                         continue
@@ -1940,7 +2062,7 @@ class JarvisLive:
                 continue
 
             _speaker_breaker.record_success()
-            name = _audio_device_name(chosen_device)
+            name = _audio_device_name(chosen_device, devices=_devices_snapshot)
             print(f"[JARVIS] 🔊 Hoparlor cihazi: {chosen_device} - {name}")
             try:
                 self.ui.set_speaker_device(name)
@@ -1961,6 +2083,10 @@ class JarvisLive:
                             and self.audio_in_queue.empty()
                         ):
                             self.set_speaking(False)
+                            try:
+                                self.ui.set_voice_volume(0.0)
+                            except Exception:
+                                pass
                             self._turn_done_event.clear()
                         continue
                     self.set_speaking(True)
@@ -1968,6 +2094,11 @@ class JarvisLive:
                         await asyncio.to_thread(stream.write, chunk)
                         _played_chunks += 1
                         _last_audio_at = time.monotonic()
+                        try:
+                            self.ui.set_voice_volume(_pcm_rms_level(chunk))
+                            self.ui.set_voice_state("ASSISTANT_SPEAKING", "JARVIS yanıt veriyor")
+                        except Exception:
+                            pass
                         if _played_chunks == 1:
                             print("[AUDIO_DIAG] İlk Gemini ses paketi hoparlör stream'ine yazıldı.")
                         elif _played_chunks % 200 == 0:

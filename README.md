@@ -102,9 +102,10 @@ Gemini veya cihaz bağlantısının doğrulandığı anlamına gelmez.
 | Manuel ve canlı kontroller | `tests/manual/` |
 
 Ortam değişkenleri arasında `JARVIS_HOME`, `JARVIS_API_KEYS`, `JARVIS_FACE` ve
-isteğe bağlı `JARVIS_NO_FIREWALL_SETUP=1` bulunur. Dashboard güvenlik duvarı
-hazırlığını atlamak açık bir kullanıcı tercihi gerektirir; paketleme testleri
-bu ağ yolunu çalıştırmaz.
+isteğe bağlı `JARVIS_ALLOW_FIREWALL_SETUP=1` bulunur. Dashboard güvenlik duvarı/UAC
+hazırlığı varsayılan olarak KAPALIDIR; bu adımı etkinleştirmek açık bir kullanıcı
+tercihi (bu değişkeni ayarlamak) gerektirir. Paketleme testleri bu ağ yolunu
+çalıştırmaz.
 
 ## Test ve doğrulama kapsamı
 
