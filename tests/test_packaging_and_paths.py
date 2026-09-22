@@ -40,7 +40,15 @@ def test_no_runtime_state_inside_package() -> None:
 
 def test_no_private_keys_or_api_keys_in_repo() -> None:
     tracked = [p for p in REPO.rglob("*") if p.is_file()
-               and "developer_archive" not in p.parts and ".git" not in p.parts]
+               and "developer_archive" not in p.parts and ".git" not in p.parts
+               # DUZELTME (canli testte bulundu, 2026-09-22): .venv icindeki
+               # 3. parti kutuphanelerin (certifi, grpc) KENDI ozel dosyalari
+               # (cacert.pem, roots.pem - gercek sertifika/anahtar degil, sadece
+               # dosya uzantisi eslesiyor) yanlislikla "sizan sir" saniliyordu -
+               # bu testin amaci REPO'nun KENDI kodundaki sizintilari yakalamak,
+               # kurulu bagimliliklarin dosyalarini degil.
+               and ".venv" not in p.parts and "node_modules" not in p.parts
+               and "__pycache__" not in p.parts]
     assert not [p for p in tracked if p.suffix in {".key", ".pem", ".pfx"}]
     marker = "BEGIN " + "RSA PRIVATE KEY"  # bu dosyanın kendisini yakalamasın
     leaked = []
