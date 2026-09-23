@@ -726,8 +726,33 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
 
-    to_install = []
+    # DUZELTME (Patch 13, 2026-09-23, 8. canli web_scraper testi): planlayici
+    # LLM, _plan_project promptundaki "standart kutuphane modulleri
+    # dependencies'e girmez" kuralina bazen uymuyor (ornegin "sqlite3").
+    # Bu fonksiyon simdiye kadar BURAYI hic kontrol etmiyordu - Patch 10'daki
+    # sys.stdlib_module_names koruması sadece REAKTIF _try_auto_install
+    # icine eklenmisti, bu PROAKTIF (ilk calistirmadan once, plan'daki
+    # listeye gore calisan) yola hic ugramamisti. Sonuc: "sqlite3" gibi bir
+    # isim her build'de sessizce pip show/install'a gonderiliyor ve HER
+    # SEFERINDE "Could not find a version that satisfies the requirement
+    # sqlite3" hatasiyla basarisiz oluyordu (zararsiz ama gereksiz/kafa
+    # karistirici bir uyari, ayrica olasi bir aginin/CI'in bosa harcanmasi).
+    # Ayni sys.stdlib_module_names kontrolunu burada da uygulayarak iki
+    # kurulum yolunu da (reaktif + proaktif) tutarli hale getiriyoruz.
+    stdlib_names = getattr(sys, "stdlib_module_names", frozenset())
+    real_dependencies = []
     for dep in dependencies:
+        pkg_name = re.split(r"[>=<!]", dep)[0].strip()
+        if pkg_name.lower() in stdlib_names:
+            print(f"[DevAgent] ⚠️ '{pkg_name}' zaten Python standart kütüphanesinin bir parçası (pip'te böyle bir paket yok) - planlayıcı bunu yanlışlıkla dependencies listesine eklemiş, kurulum denenmeyecek.")
+            continue
+        real_dependencies.append(dep)
+
+    if not real_dependencies:
+        return "No external dependencies (all listed names were standard-library modules, skipped)."
+
+    to_install = []
+    for dep in real_dependencies:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         result = subprocess.run(
             [sys.executable, "-m", "pip", "show", pkg_name],
@@ -739,7 +764,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
             print(f"[DevAgent] ✓ Already installed: {pkg_name}")
 
     if not to_install:
-        return f"All dependencies already installed: {', '.join(dependencies)}"
+        return f"All dependencies already installed: {', '.join(real_dependencies)}"
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
     try:
