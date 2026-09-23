@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -1192,6 +1193,21 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
         print("[DevAgent] ⚠️ 'jarvis' harici bir paket değil, bu projeye YANLIŞLIKLA eklenmiş bir import olmalı - kurulum denenmeyecek.")
         return False
 
+    # DUZELTME (2026-09-23, 7. canli web_scraper testi): "sqlite3" gibi
+    # Python standart kutuphanesinin PARCASI olan modul isimleri de bazen
+    # buraya "eksik" gibi geliyor (baska bir hata sinifi - importun
+    # kendisi degil, kod BASKA bir sebeple calismiyor - ama _classify_error
+    # bunu "No module named"/dependency_error olarak etiketleyebiliyor).
+    # Bunlari pip ile kurmaya calismak HER ZAMAN basarisiz olur ("Could not
+    # find a version that satisfies the requirement sqlite3") ve "jarvis"
+    # halusinasyonuyla AYNI zaman-kaybi/yanlis-izlenim sorununu yaratir.
+    # sys.stdlib_module_names (3.10+) TUM standart kutuphane modullerinin
+    # kesin listesini verir - "jarvis" icin yapilan ozel kontrolun daha
+    # genel, otomatik-guncel hali.
+    if module_name in getattr(sys, "stdlib_module_names", frozenset()):
+        print(f"[DevAgent] ⚠️ '{module_name}' zaten Python standart kütüphanesinin bir parçası (pip'te böyle bir paket yok, ayrıca kurulmasına gerek yok) - kurulum denenmeyecek.")
+        return False
+
     pkg = _IMPORT_TO_PYPI.get(module_name.lower(), module_name.replace("_", "-"))
     print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg} (import: {module_name})")
     try:
@@ -1226,6 +1242,78 @@ def _search_error_context(error_output: str) -> str:
         return ""
 
 
+def _resolve_dotted_module_to_path(module_dotted: str, project_files: list[str]) -> "str | None":
+    """'web.scrape' gibi nokta-ayrimli bir modul adini, projenin GERCEK
+    dosya yoluna ('web/scrape.py') esler. Proje dosyalari arasinda
+    bulunamazsa (harici bir paketse) None doner."""
+    candidate = module_dotted.replace(".", "/") + ".py"
+    candidate_init = module_dotted.replace(".", "/") + "/__init__.py"
+    for pf in project_files:
+        normalized = pf.replace("\\", "/")
+        if normalized == candidate or normalized == candidate_init:
+            return pf
+    return None
+
+
+def _extract_top_level_names(source: str) -> list[str]:
+    """Bir Python dosyasinin en ust seviyede tanimladigi, BASKA bir
+    dosyanin "from X import Y" ile alabilecegi isimleri (fonksiyon, sinif,
+    modul-seviyesi degisken) cikarir. Regex degil AST kullanir - yorum
+    satirlarindaki veya string icindeki "def "/"class " gibi sahte
+    eslesmelere karsi guvenlidir."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.append(target.id)
+    return names
+
+
+def _detect_import_name_mismatch(error_output: str, file_codes: dict[str, str]) -> "dict | None":
+    """"cannot import name 'X' from 'Y'" seklindeki bir ImportError'i,
+    projenin GERCEK dosyalariyla eslestirip somut, eyleme-donusturulebilir
+    bir teshis uretir: X hangi dosyadan isteniyor, o dosyada GERCEKTE
+    hangi isimler tanimli.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 7. canli web_scraper testinde
+    main.py, 'web/scrape.py'den 'fetch_pages' import etmeye calisiyordu
+    ama o isim orada tanimli degildi - AYNI hata 5 denemenin 5'inde de
+    DEGISMEDEN tekrarlandi. Kok neden: _fix_files'in "import_error" dali,
+    SADECE error_file'i (main.py, traceback'in gosterdigi yer) duzeltme
+    adayi yapiyor ve "error_file'i import eden dosyalari" ariyordu - ama
+    error_file zaten giris noktasi oldugu icin onu import eden hicbir
+    dosya yok, bu arama hep bos donuyordu. Asil eksik olan, main.py'nin
+    KENDISININ import ETTIGI hedef modul (web/scrape.py) - o dosya hicbir
+    zaman ayri bir duzeltme denemesi olarak ele alinmadigi icin LLM, onun
+    GERCEKTE ne icerdigini gormeden (sadece 1500 karakterle kirpilmis
+    "read-only" baglamdan tahmin ederek) ayni yanlis ismi tekrar tekrar
+    uretmeye devam ediyordu."""
+    match = re.search(
+        r"cannot import name ['\"](\w+)['\"] from ['\"]([\w\.]+)['\"]",
+        error_output,
+    )
+    if not match:
+        return None
+    missing_name, target_module = match.group(1), match.group(2)
+    target_path = _resolve_dotted_module_to_path(target_module, list(file_codes.keys()))
+    if not target_path:
+        return None
+    actual_names = _extract_top_level_names(file_codes.get(target_path, ""))
+    return {
+        "missing_name": missing_name,
+        "target_module": target_module,
+        "target_path": target_path,
+        "actual_names": actual_names,
+    }
+
+
 def _fix_files(
     error_output: str,
     project_description: str,
@@ -1249,6 +1337,18 @@ def _fix_files(
     # error_output metnini kendimiz siniflandiriyoruz.
     error_type = known_error_type or _classify_error(error_output)
     web_context = _search_error_context(error_output)
+
+    # DUZELTME (2026-09-23, 7. canli web_scraper testi - bkz.
+    # _detect_import_name_mismatch docstring'i): "cannot import name X from
+    # Y" hatasinda, asil duzeltilmesi/incelenmesi gereken dosya cogu zaman
+    # error_file (import EDEN dosya) degil, Y'nin KENDISIDIR (import
+    # EDILEN, ismi eksik olan dosya). Bunu, asagidaki files_to_fix
+    # olusturmadan ONCE tespit ediyoruz ki hem error_file hem target_path
+    # duzeltme adayi olabilsin.
+    import_mismatch = (
+        _detect_import_name_mismatch(error_output, file_codes)
+        if error_type == "import_error" else None
+    )
 
     files_to_fix: list[str] = []
 
@@ -1278,6 +1378,12 @@ def _fix_files(
     else:
         files_to_fix.append(entry_point)
 
+    if import_mismatch and import_mismatch["target_path"] not in files_to_fix:
+        # Hedef modulu (import EDILEN, ismi eksik olan dosya) de kendi
+        # ayri duzeltme denemesini alsin - sadece error_file'in "read-only"
+        # baglaminda 1500 karaktere kirpilmis halde gorunmesin.
+        files_to_fix.append(import_mismatch["target_path"])
+
     updated_codes: dict[str, str] = {}
 
     for fix_path in files_to_fix:
@@ -1292,6 +1398,26 @@ def _fix_files(
         line_hint = f"\nError appears to be near line {error_line} in this file." if (
             error_line and fix_path == error_file
         ) else ""
+
+        import_mismatch_note = ""
+        if import_mismatch:
+            names_list = ", ".join(import_mismatch["actual_names"]) or "(no top-level functions/classes/variables found in that file at all)"
+            import_mismatch_note = (
+                f"\n\nIMPORT NAME MISMATCH DETECTED (this is very likely the real bug): "
+                f"some file does `from {import_mismatch['target_module']} import "
+                f"{import_mismatch['missing_name']}`, but {import_mismatch['target_path']} "
+                f"does NOT define anything called '{import_mismatch['missing_name']}'. "
+                f"The names ACTUALLY defined at the top level of "
+                f"{import_mismatch['target_path']} are: {names_list}. Fix this by either "
+                f"(a) if you are editing the file that imports it, change the import "
+                f"statement to use whichever of these existing names provides the same "
+                f"functionality, or (b) if you are editing {import_mismatch['target_path']} "
+                f"itself, add or rename a function/class so that "
+                f"'{import_mismatch['missing_name']}' actually exists there with the "
+                f"expected behavior. Pick exactly one of these two fixes — do not leave "
+                f"the same mismatched name in place, and do not fix it in both files "
+                f"(that would just create a new, different mismatch)."
+            )
 
         shared_contracts_block = (
             "Shared data contracts ALL files must follow EXACTLY:\n" + shared_contracts
@@ -1323,6 +1449,7 @@ Error type: {error_type}
 
 Error output:
 {error_output[:2500]}
+{import_mismatch_note}
 {web_context}
 Current (broken) code:
 {current_code}
