@@ -1356,6 +1356,274 @@ def _proactively_add_request_timeouts(project_dir: Path, file_codes: dict[str, s
     return fixed_paths
 
 
+# DUZELTME (Yama 14, 2026-09-23): Kullanicinin sordugu "tum dosyayi tarayip
+# calisir hale getiren hazir bir program yok mu" sorusuna cevaben eklendi.
+# Boyle sihirli/genel bir arac YOK VE OLAMAZ (bir programin GERCEKTEN
+# istenen seyi yaptigini, calistirmadan/anlamdan kesin olarak bilmenin bir
+# yolu yok - bu, "duzeltme" degil "dogrulama" sorunu). AMA "tanimsiz isim"
+# (NameError'a yol acacak) ve syntax hatasi gibi GENIS bir kategori, kodu
+# hic calistirmadan, olgun ve hazir bir statik analiz araciyla (ruff -
+# dev_agent'in KENDI CI'inde zaten kullandigimiz ayni arac) tespit
+# edilebilir. Bunu tek tek her hata sinifi icin elle AST kontrolu yazmak
+# yerine (Yama 10/11 gibi), dogrudan ruff'a devrediyoruz - "boyle bir
+# program var mi" sorusunun dogru cevabi "var, ama ozel amacli degil,
+# genel amacli bir linter; onu tekrar icat etmeye gerek yok".
+#
+# Bu kontrol ozellikle onemli cunku: bir arka plan thread'i (threading.Thread
+# ile baslatilan) icindeki bir NameError, ana thread'e/GUI'ye hicbir
+# traceback sizdirmadan SESSIZCE thread'i oldurebilir - ana pencere/mainloop
+# calismaya devam eder, hicbir Python hatasi gorunmez, tek belirti programin
+# "cokmeden ama beklenen ciktiyi uretmeden" zaman asimina ugramasidir - tam
+# olarak 8. canli web_scraper testinde gozlemlenen "90 saniye timeout +
+# database.db guncellenmedi" belirtisiyle ayni sinif. Bu yuzden bu kontrolu,
+# _run_project hic cagrilmadan, dosyalar yazildiktan hemen sonra yapiyoruz -
+# boylece MAX_FIX_ATTEMPTS butcesinden hicbir sey harcamadan (ve 30-90
+# saniyelik bosa gecen bir calistirmadan) yakalanip duzeltilebilir.
+#
+# SADECE yuksek-guven, KESIN calisma-zamani hatasi anlamina gelen kurallar
+# secildi: F821 (tanimsiz isim - NameError), F822/F823 (ilgili tanimsiz-
+# referans durumlari), E9 (syntax hatalari - programin ic parse bile
+# edilemeyecegi anlamina gelir). F401 (kullanilmayan import) / F841
+# (kullanilmayan degisken) BILEREK DISARIDA - bunlar gercek bir CALISMA
+# HATASI degil, sadece stil/temizlik bilgisi; projenin "belirsizse/riskli
+# ise dokunma" felsefesiyle tutarli olarak, gercek bir crash'e yol
+# acmayacak seyler icin LLM'e gereksiz "duzeltme" gorevi verilmiyor.
+_RUFF_PROACTIVE_SELECT = "F821,F822,F823,E9"
+
+
+def _run_ruff_check(project_dir: Path):
+    """`ruff` bazi kurulumlarda "python -m ruff" olarak (normal pip paketi -
+    dev_agent'in KENDI CI'inde kullandigi sekilde), bazilarinda ise sadece
+    PATH'te bagimsiz bir yurutulebilir dosya olarak (orn. uv/pipx ile
+    kurulmus) bulunabilir. Ikisini de sirayla dener - hangisi calisirsa onu
+    kullanir. Hicbiri calismazsa None doner (istisna FIRLATMAZ)."""
+    for cmd_prefix in ([sys.executable, "-m", "ruff"], ["ruff"]):
+        try:
+            result = subprocess.run(
+                cmd_prefix + ["check", "--select", _RUFF_PROACTIVE_SELECT,
+                              "--output-format", "json", str(project_dir)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except Exception:
+            continue
+        # ONEMLI: "python -m ruff" modulu hic YOKSA, Python bunu da
+        # returncode 1 ile bitirir (tipki ruff'in "bulgu var" durumu gibi!)
+        # - ikisini SADECE returncode'a bakarak ayirt edemeyiz. stderr'de
+        # "No module named" gecmesi, bu komut FORMUNUN gecersiz oldugunu
+        # (ve JSON stdout'un bos/anlamsiz oldugunu) gosterir - bu durumda
+        # yanlislikla "temiz, bulgu yok" sonucuna varmak yerine diger
+        # komut seklini (bagimsiz "ruff" yurutulebilir dosyasi) deniyoruz.
+        module_missing = "No module named" in (result.stderr or "")
+        if result.returncode in (0, 1) and not module_missing:
+            return result
+    return None
+
+
+def _proactively_lint_generated_files(project_dir: Path, file_codes: dict[str, str]) -> "dict[str, list[dict]] | None":
+    """Projedeki TUM dosyalara, ilk calistirmadan once ruff (sadece yukarida
+    aciklanan yuksek-guven kural alt kumesiyle) uygular. Bulgu yoksa veya
+    ruff bu ortamda hic kullanilamiyorsa (kurulu degil, kurulumu basarisiz,
+    ag yok, vb.) SESSIZCE None doner - bu opsiyonel bir iyilestirmedir,
+    dev_agent'in temel calismasi buna BAGLI DEGILDIR ve asla build'i
+    engellemez ya da kullaniciya hata olarak gosterilmez."""
+    result = _run_ruff_check(project_dir)
+    if result is None:
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "ruff"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            return None
+        result = _run_ruff_check(project_dir)
+        if result is None:
+            return None
+
+    try:
+        findings = json.loads(result.stdout or "[]")
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not findings:
+        return None
+
+    issues_by_file: dict[str, list[dict]] = {}
+    for finding in findings:
+        abs_path = finding.get("filename", "")
+        if not abs_path:
+            continue
+        try:
+            rel_path = Path(abs_path).resolve().relative_to(project_dir.resolve()).as_posix()
+        except (ValueError, OSError):
+            continue
+        if rel_path not in file_codes:
+            continue
+        loc = finding.get("location") or {}
+        issues_by_file.setdefault(rel_path, []).append({
+            "code": finding.get("code") or "?",
+            "message": finding.get("message") or "",
+            "line": loc.get("row"),
+            "col": loc.get("column"),
+        })
+
+    return issues_by_file or None
+
+
+# DUZELTME (Yama 15, 2026-09-23, 8. canli web_scraper testi): "database.db
+# guncellenmiyor + 90s zaman asimi" belirtisinin GERCEK kok nedeni bulundu -
+# LLM'in olusturdugu Tkinter uygulamasi, asil isi (scraping'i baslatan
+# thread) SADECE bir "Start Scraping" butonuna tiklaninca calistiriyordu;
+# __init__ icinde OTOMATIK cagrilmiyordu (bkz. o testten cekilen gercek
+# main.py: ilk hali sadece create_widgets() cagiriyordu, start_scraping()
+# YOK). dev_agent'in kendi calistirma/dogrulama mekanizmasi GUI'yi baslatir
+# ama HICBIR ZAMAN gercek bir insan gibi butona tiklamaz - bu yuzden program
+# hicbir Python hatasi vermeden, sadece "bos" bir pencere acik kalarak
+# zaman asimina ugruyor ve expected_outputs (orn. database.db) hicbir zaman
+# guncellenmiyor. Bu, Patch 9'un "otomatik baslangic yolunda bloklayan
+# dialog cagirma" kuralinin dogal bir uzantisi: bir GUI, otomatik/headless
+# dogrulamada calisacaksa, asil isini kullanicidan BAGIMSIZ olarak da
+# tetiklemelidir.
+#
+# YANLIS POZITIFTEN KACINMAK ICIN (orn. bir "Temizle"/"Çıkış" butonunun
+# KASITLI OLARAK sadece tiklamayla calismasi gerektigi durumu yanlislikla
+# "otomatik calistir" diye isaretlememek icin) COK KATI/dar bir kural
+# kullaniliyor - Yama 11'deki "tek aday" felsefesiyle BIREBIR AYNI: sadece
+# TUM SINIFTA TEK BIR boyle buton/menu-komutu varsa (yani hangi eylemin
+# "asil is" oldugu konusunda HICBIR belirsizlik yoksa) VE o metod sinifin
+# baska hicbir yerinde cagrilmiyorsa isaretlenir; 2+ boyle komut varsa
+# (Start/Stop/Clear gibi), HANGISININ otomatik calismasi gerektigi
+# belirsizdir - bu durumda TAMAMEN SESSIZ KALINIR, tahmin yurutulmez.
+_GUI_TRIGGER_WIDGET_SUFFIXES = ("Button",)
+_GUI_TRIGGER_METHOD_NAMES = frozenset({"add_command"})
+
+
+def _call_func_name(call: ast.Call) -> str:
+    """Bir Call node'unun cagirdigi fonksiyon/metodun SON isim parcasini
+    dondurur (orn. ttk.Button(...) icin 'Button', menu.add_command(...) icin
+    'add_command'). Eslesme yoksa bos string doner."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _detect_gui_manual_only_trigger(source: str) -> "list[dict] | None":
+    """Tek bir dosyanin kaynagini tarar; yukarida aciklanan KATI kurala gore
+    'sadece butona bagli, hicbir yerde otomatik cagrilmayan' bir GUI
+    tetikleyicisi bulursa, o dosya icin bulgu listesini doner (yoksa None)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    findings: list[dict] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        base_names = []
+        for base in node.bases:
+            if isinstance(base, ast.Attribute):
+                base_names.append(base.attr)
+            elif isinstance(base, ast.Name):
+                base_names.append(base.id)
+        looks_like_gui = any(("Tk" in b or "Frame" in b) for b in base_names)
+        if not looks_like_gui:
+            continue
+
+        has_init = any(
+            isinstance(item, ast.FunctionDef) and item.name == "__init__"
+            for item in node.body
+        )
+        if not has_init:
+            continue
+
+        # DUZELTME (kendi Yama-15 testimde bulundu): "baska yerde de
+        # kullaniliyor mu" kontrolunu SADECE dogrudan self.X(...)
+        # CAGRILARIYLA sinirlamak yanlis pozitif veriyordu - orn.
+        # self.after(100, self.X) veya Thread(target=self.X) gibi, X'i bir
+        # CALLBACK olarak baska bir cagriya ARGUMAN olarak GECEN (ama
+        # kendisi dogrudan CAGIRMAYAN) COK YAYGIN, MESRU otomatik-tetikleme
+        # kaliplarini "hic kullanilmiyor" saniyordu. Bu yuzden "baska yerde
+        # kullanim" kontrolu artik cok daha genis: command= kwarg SLOTUNUN
+        # KENDISI HARIC, sinif icindeki HERHANGI bir self.X referansi
+        # (cagrilsin cagrilmasin) "baska yerde de var" sayilir - bu, olasi
+        # yanlis pozitifi tamamen ortadan kaldiran, KASITLI OLARAK daha
+        # MUHAFAZAKAR bir tanim (Yama 11/15'in "belirsizse dokunma"
+        # felsefesiyle tutarli: az bulgu, ama bulunanlar yuksek guvenli).
+        trigger_candidates: list[tuple[str, int]] = []
+        trigger_slot_node_ids: set[int] = set()
+
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            func_name = _call_func_name(sub)
+            is_trigger_widget = (
+                func_name.endswith(_GUI_TRIGGER_WIDGET_SUFFIXES)
+                or func_name in _GUI_TRIGGER_METHOD_NAMES
+            )
+            if is_trigger_widget:
+                for kw in sub.keywords:
+                    if (kw.arg == "command" and isinstance(kw.value, ast.Attribute)
+                            and isinstance(kw.value.value, ast.Name)
+                            and kw.value.value.id == "self"):
+                        trigger_candidates.append((kw.value.attr, sub.lineno))
+                        trigger_slot_node_ids.add(id(kw.value))
+
+        other_referenced: set[str] = set()
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "self" and id(sub) not in trigger_slot_node_ids):
+                other_referenced.add(sub.attr)
+
+        uncalled = [
+            (name, lineno) for (name, lineno) in trigger_candidates
+            if name not in other_referenced
+        ]
+
+        if len(trigger_candidates) == 1 and len(uncalled) == 1:
+            name, lineno = uncalled[0]
+            findings.append({
+                "code": "GUI-MANUAL-ONLY-TRIGGER",
+                "message": (
+                    f"class '{node.name}' wires a button/menu command to "
+                    f"'self.{name}', but self.{name}(...) is NEVER also "
+                    f"called automatically (e.g. at the end of __init__). "
+                    f"This is the ONLY such command in the class, so it is "
+                    f"almost certainly the app's core/real work. An "
+                    f"automated headless test harness runs this script but "
+                    f"can never click a button, so self.{name} will NEVER "
+                    f"execute and no expected output will ever be produced "
+                    f"— the program will just sit idle until it times out. "
+                    f"Fix by ALSO calling self.{name}() automatically (for "
+                    f"example at the end of __init__, or scheduled via "
+                    f"self.after(100, self.{name}) if it needs the GUI to "
+                    f"be fully constructed first) — keep the button working "
+                    f"too, for real interactive use."
+                ),
+                "line": lineno,
+                "col": 0,
+            })
+
+    return findings or None
+
+
+def _proactively_detect_gui_manual_only_triggers(file_codes: dict[str, str]) -> "dict[str, list[dict]] | None":
+    """Projedeki TUM dosyalara _detect_gui_manual_only_trigger uygular ve
+    sonuclari _proactively_lint_generated_files ile AYNI sekle
+    ({dosya: [bulgu, ...]}) getirir - boylece ikisi tek bir _fix_files
+    cagrisinda BIRLESTIRILEBILIR (asagida _build_project'te yapiliyor)."""
+    issues_by_file: dict[str, list[dict]] = {}
+    for fp, code in file_codes.items():
+        findings = _detect_gui_manual_only_trigger(code)
+        if findings:
+            issues_by_file[fp] = findings
+    return issues_by_file or None
+
+
 # Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
 # paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
 # yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
@@ -1545,6 +1813,7 @@ def _fix_files(
     shared_contracts: str = "",
     expected_outputs: str = "",
     known_error_type: str = "",
+    lint_issues: "dict[str, list[dict]] | None" = None,
 ) -> dict[str, str]:
 
     model = _get_model(MODEL_PLANNER)
@@ -1572,7 +1841,15 @@ def _fix_files(
 
     files_to_fix: list[str] = []
 
-    if error_file:
+    # DUZELTME (Yama 14): proaktif ruff bulgulari icin - error_output bir
+    # traceback DEGIL (henuz hic calistirilmadi), bu yuzden error_file/
+    # _parse_traceback burada hicbir sey bulamaz. ruff zaten HANGI
+    # dosyada oldugunu tam olarak soyluyor, o yuzden files_to_fix'i
+    # dogrudan lint_issues'un anahtarlarindan olusturuyoruz - asagidaki
+    # traceback-tabanli dallara hic girmeden.
+    if error_type == "lint_error" and lint_issues:
+        files_to_fix = sorted(lint_issues.keys())
+    elif error_file:
         files_to_fix.append(error_file)
         if error_type == "import_error":
             for fi in all_files:
@@ -1639,6 +1916,23 @@ def _fix_files(
                 f"(that would just create a new, different mismatch)."
             )
 
+        lint_issues_note = ""
+        if lint_issues and fix_path in lint_issues:
+            lines_desc = "\n".join(
+                f"  - Line {iss.get('line')}, col {iss.get('col')}: [{iss.get('code')}] {iss.get('message')}"
+                for iss in lint_issues[fix_path]
+            )
+            lint_issues_note = (
+                f"\n\nSTATIC ANALYSIS FOUND THESE LIKELY RUNTIME BUGS in this exact "
+                f"file, found BEFORE the program was ever run:\n{lines_desc}\n"
+                f"A code like NameError/UnboundLocalError/E9xx (from ruff) means a name "
+                f"that does not exist at that point in the code, or a genuine syntax "
+                f"problem — fix it precisely. A code like GUI-MANUAL-ONLY-TRIGGER means "
+                f"the described method is only reachable via a button/menu click and is "
+                f"never also invoked automatically — fix it exactly as the message "
+                f"describes, while keeping the button itself working too."
+            )
+
         shared_contracts_block = (
             "Shared data contracts ALL files must follow EXACTLY:\n" + shared_contracts
         ) if shared_contracts else ""
@@ -1670,6 +1964,7 @@ Error type: {error_type}
 Error output:
 {error_output[:2500]}
 {import_mismatch_note}
+{lint_issues_note}
 {web_context}
 Current (broken) code:
 {current_code}
@@ -1825,6 +2120,42 @@ def _build_project(
     timeout_fixed = _proactively_add_request_timeouts(project_dir, file_codes)
     if timeout_fixed:
         log(f"İlk çalıştırmadan önce {len(timeout_fixed)} dosyadaki eksik HTTP timeout'u proaktif olarak eklendi: {timeout_fixed}")
+
+    # DUZELTME (Yama 14): ruff ile genis kapsamli, yuksek-guven statik analiz
+    # (tanimsiz isim/syntax) - bkz. _proactively_lint_generated_files
+    # docstring'i. ruff bu ortamda kullanilamiyorsa (kurulu degil/kurulamadi)
+    # SESSIZCE None doner, build hicbir sekilde engellenmez.
+    lint_issues = _proactively_lint_generated_files(project_dir, file_codes) or {}
+
+    # DUZELTME (Yama 15): "buton olmadan asla calismayan GUI" tespiti - bkz.
+    # _detect_gui_manual_only_trigger docstring'i. Ayni {dosya: [bulgu,...]}
+    # sekli oldugu icin ruff bulgularinin AYNI sozluguyle birlestirilip TEK
+    # bir _fix_files cagrisinda (mumkunse tek bir model isteginde) hem statik
+    # analiz hem bu davranissal sorun cozdurulebiliyor.
+    gui_trigger_issues = _proactively_detect_gui_manual_only_triggers(file_codes) or {}
+    for _fp, _issues in gui_trigger_issues.items():
+        lint_issues.setdefault(_fp, []).extend(_issues)
+
+    if lint_issues:
+        affected = ", ".join(sorted(lint_issues.keys()))
+        log(f"İlk çalıştırmadan önce statik analizle olası çalışma-zamanı/davranış hatası tespit edildi ({affected}), model ile düzeltiliyor (bir çalıştırma denemesi harcanmadan)...")
+        try:
+            lint_fixed = _fix_files(
+                error_output="Static analysis found likely runtime bugs before the program was ever run — see per-file details below.",
+                project_description=description,
+                all_files=files,
+                file_codes=file_codes,
+                language=language,
+                project_dir=project_dir,
+                entry_point=entry_point,
+                shared_contracts=shared_contracts_text,
+                expected_outputs=expected_outputs_text,
+                known_error_type="lint_error",
+                lint_issues=lint_issues,
+            )
+            file_codes.update(lint_fixed)
+        except RateLimitError:
+            log("Rate limit - ruff proaktif düzeltmesi atlandı, normal çalıştırma denemesine geçiliyor.")
 
     if dependencies:
         install_result = _install_dependencies(dependencies, project_dir)
