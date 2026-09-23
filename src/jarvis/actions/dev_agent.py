@@ -1356,6 +1356,107 @@ def _proactively_add_request_timeouts(project_dir: Path, file_codes: dict[str, s
     return fixed_paths
 
 
+# DUZELTME (Yama 16, 2026-09-23, 9. canli web_scraper testi): GERCEK,
+# tekrar tekrar gozlemlenen bir baska sessiz-basarisizlik sinifi daha:
+# requests.get(url, timeout=10) gibi TIMEOUT'U OLAN ama 'headers=' HIC
+# OLMAYAN bir cagri, Wikipedia gibi bircok gercek sitede "403 Client Error:
+# Forbidden" ile REDDEDILIYOR - cunku bu siteler varsayilan
+# "python-requests/x.x" User-Agent'ini engelliyor. Bu bir Python hatasi
+# DEGIL (kod duzgun calisiyor, sadece HTTP katmaninda reddediliyor), bu
+# yuzden hicbir onceki yama bunu kapsamiyordu. _add_missing_request_timeouts
+# ile AYNI cerrahi-ekleme yontemini (mutlak offset + geriye-dogru-virgul-
+# kontrolu) kullanarak, SADECE 'headers=' PARAMETRESI HIC OLMAYAN
+# cagrilara (var olan bir headers= sozlugunu KARISTIRMAYA CALISMIYORUZ -
+# icinde User-Agent olup olmadigini guvenilir sekilde anlamak AST'de
+# genel durumda imkansiz; belirsizse dokunma felsefesi) tarayici-benzeri
+# bir varsayilan User-Agent ekliyoruz.
+_DEFAULT_SCRAPER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _add_missing_user_agent_header(source: str) -> "tuple[str, int]":
+    """Kaynak kodda DOGRUDAN 'requests.get(...)'/'requests.post(...)' vb.
+    seklinde yapilan HTTP cagrilarinda 'headers=' parametresi HIC yoksa,
+    guvenli bir varsayilan tarayici User-Agent'i ekler - bkz. yukaridaki
+    modul-seviyesi yorum icin gercek motivasyon. _add_missing_request_timeouts
+    ile BIREBIR AYNI cerrahi ekleme yontemini kullanir (kod tekrarini
+    onlemek yerine, Yama 12'nin zaten test edilmis/canlida dogrulanmis
+    fonksiyonuna DOKUNMADAN, ayni deseni yeniden uygulamayi tercih ettik -
+    boylece Yama 12'nin davranisinda regresyon riski SIFIR)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, 0
+
+    src_lines = source.splitlines(keepends=True)
+    line_start_offsets = [0]
+    for src_line in src_lines:
+        line_start_offsets.append(line_start_offsets[-1] + len(src_line))
+
+    def _to_offset(lineno: int, col: int) -> int:
+        return line_start_offsets[lineno - 1] + col
+
+    insert_offsets: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "requests"
+            and func.attr in _REQUESTS_HTTP_METHODS
+        ):
+            continue
+        if any(kw.arg == "headers" for kw in node.keywords):
+            continue
+        if any(kw.arg is None for kw in node.keywords):  # **kwargs yayilimi - dokunma
+            continue
+        if not node.args and not node.keywords:
+            continue
+        end_lineno = getattr(node, "end_lineno", None)
+        end_col = getattr(node, "end_col_offset", None)
+        if end_lineno is None or end_col is None:
+            continue
+        insert_offsets.append(_to_offset(end_lineno, end_col) - 1)
+
+    if not insert_offsets:
+        return source, 0
+
+    result = source
+    header_literal = f"{{'User-Agent': '{_DEFAULT_SCRAPER_USER_AGENT}'}}"
+    for off in sorted(insert_offsets, reverse=True):
+        j = off - 1
+        while j >= 0 and result[j] in " \t\r\n":
+            j -= 1
+        needs_comma = not (j >= 0 and result[j] == ",")
+        insertion = f", headers={header_literal}" if needs_comma else f" headers={header_literal}"
+        result = result[:off] + insertion + result[off:]
+
+    return result, len(insert_offsets)
+
+
+def _proactively_add_user_agent_headers(project_dir: Path, file_codes: dict[str, str]) -> list[str]:
+    """Proje HENUZ calistirilmadan, TUM dosyalarda dogrudan
+    'requests.get/post/...(...)' seklinde yapilan HTTP cagrilarina, 'headers='
+    hic yoksa varsayilan bir tarayici User-Agent'i ekler - bkz.
+    _add_missing_user_agent_header docstring'i icin gercek motivasyon."""
+    fixed_paths: list[str] = []
+    for fp, code in list(file_codes.items()):
+        new_code, count = _add_missing_user_agent_header(code)
+        if count:
+            full_path = _safe_project_path(project_dir, fp)
+            if full_path is None or not full_path.is_file():
+                continue
+            full_path.write_text(new_code, encoding="utf-8")
+            file_codes[fp] = new_code
+            fixed_paths.append(fp)
+            print(f"[DevAgent] 🔧 {fp}: {count} adet 'requests' çağrısına eksik User-Agent header'ı eklendi (403 Forbidden riskine karşı).")
+    return fixed_paths
+
+
 # DUZELTME (Yama 14, 2026-09-23): Kullanicinin sordugu "tum dosyayi tarayip
 # calisir hale getiren hazir bir program yok mu" sorusuna cevaben eklendi.
 # Boyle sihirli/genel bir arac YOK VE OLAMAZ (bir programin GERCEKTEN
@@ -1872,6 +1973,35 @@ def _fix_files(
         for fp, code in file_codes.items():
             if fp != entry_point and any(hint in code for hint in _persistence_hints):
                 files_to_fix.append(fp)
+    elif error_type == "runtime_error":
+        # DUZELTME (Yama 17, 2026-09-23, 9. canli web_scraper testi): GERCEK
+        # canlida gozlemlendi - bir istisna YAKALANIP print edilirse (orn.
+        # `except requests.RequestException as e: print(f"Failed to fetch
+        # {url}: {e}")`), cikti "403 Client Error: Forbidden" gibi bir metin
+        # icerir ("error:" gectigi icin _classify_error bunu dogru sekilde
+        # "runtime_error" sayar) AMA hicbir zaman gercek bir Python
+        # traceback'i ("File ..., line N") ICERMEZ - cunku hata zaten
+        # yakalanmis, hic firlatilmamistir. Bu durumda _parse_traceback
+        # HICBIR SEY bulamadigi icin error_file HER ZAMAN None olur ve
+        # (bu dal olmadan) asagidaki son "else" SADECE entry_point'i
+        # hedefler. Ama asil bozuk kod (orn. eksik User-Agent header'i
+        # yuzunden 403 alan requests.get cagrisi) COGU ZAMAN entry_point'te
+        # DEGIL, cagriyi yapan yardimci dosyada (utils/helpers.py gibi)
+        # bulunur. Canli testte GOZLEMLENDI: LLM 4 kez ust uste main.py'yi
+        # "duzeltti" ama zaten dogru oldugu icin HER SEFERINDE BAYT BAYT
+        # AYNI kodu geri uretti - gercek bozuk dosyaya (helpers.py) HICBIR
+        # ZAMAN dokunulmadi, 5 denemenin tamami bosa gitti. Bu yuzden
+        # "output_missing" ile AYNI mantik: entry_point ile birlikte, ag/IO
+        # cagrisi barindiran TUM dosyalari da adaylara ekliyoruz.
+        files_to_fix.append(entry_point)
+        _no_traceback_hints = (
+            "requests.get(", "requests.post(", "requests.put(", "requests.delete(",
+            "requests.patch(", "requests.head(", "requests.Session(",
+            "urlopen(", "httpx.", ".raise_for_status(",
+        )
+        for fp, code in file_codes.items():
+            if fp != entry_point and any(hint in code for hint in _no_traceback_hints):
+                files_to_fix.append(fp)
     else:
         files_to_fix.append(entry_point)
 
@@ -2120,6 +2250,17 @@ def _build_project(
     timeout_fixed = _proactively_add_request_timeouts(project_dir, file_codes)
     if timeout_fixed:
         log(f"İlk çalıştırmadan önce {len(timeout_fixed)} dosyadaki eksik HTTP timeout'u proaktif olarak eklendi: {timeout_fixed}")
+
+    # DUZELTME (Yama 16): dogrudan requests.get/post vb. cagrilarinda
+    # 'headers=' hic yoksa varsayilan bir tarayici User-Agent'i ekle - bkz.
+    # _add_missing_user_agent_header docstring'i. Bircok gercek site
+    # (Wikipedia dahil) varsayilan python-requests User-Agent'ini 403 ile
+    # reddediyor; bu bir Python hatasi olmadigi icin _classify_error bunu
+    # traceback'siz bir "runtime_error" olarak gorur ve (Yama 17 olmadan)
+    # dogru dosyayi hic bulamazdi.
+    user_agent_fixed = _proactively_add_user_agent_headers(project_dir, file_codes)
+    if user_agent_fixed:
+        log(f"İlk çalıştırmadan önce {len(user_agent_fixed)} dosyadaki eksik User-Agent header'ı proaktif olarak eklendi: {user_agent_fixed}")
 
     # DUZELTME (Yama 14): ruff ile genis kapsamli, yuksek-guven statik analiz
     # (tanimsiz isim/syntax) - bkz. _proactively_lint_generated_files
