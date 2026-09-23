@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,8 +28,12 @@ def test_data_path_and_legacy_fallback_are_explicit(tmp_path, monkeypatch):
     assert paths.data_dir() == legacy_root
 
     monkeypatch.setenv("JARVIS_USE_LEGACY_DATA", "0")
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
-    assert paths.data_dir() == tmp_path / "xdg" / paths.APP_NAME
+    if sys.platform == "win32":
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+        assert paths.data_dir() == tmp_path / "localappdata" / paths.APP_NAME
+    elif sys.platform != "darwin":
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+        assert paths.data_dir() == tmp_path / "xdg" / paths.APP_NAME
 
 
 def test_save_config_merges_atomically_and_keeps_existing_settings(tmp_path, monkeypatch):
@@ -44,7 +49,8 @@ def test_save_config_merges_atomically_and_keeps_existing_settings(tmp_path, mon
         "os_system": "linux",
         "camera_index": 2,
     }
-    assert first.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert first.stat().st_mode & 0o777 == 0o600
 
     first.write_text("{malformed", encoding="utf-8")
     secure_config.save_config({"camera_index": 3})
@@ -215,7 +221,8 @@ def test_tls_generation_is_user_local(tmp_path, monkeypatch):
     assert cert.parent == key.parent
     assert key.read_bytes().startswith(b"-----BEGIN")
     assert cert.read_bytes().startswith(b"-----BEGIN CERTIFICATE-----")
-    assert key.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert key.stat().st_mode & 0o777 == 0o600
     assert key.parent.parent.parent == tmp_path
     assert not (Path(__file__).resolve().parents[1] / "src/jarvis/config/certs/jarvis.key").exists()
 

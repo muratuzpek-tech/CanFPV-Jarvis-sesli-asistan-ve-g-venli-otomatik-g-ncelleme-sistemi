@@ -25,6 +25,9 @@ from jarvis.actions.windows_shell import run, list_allowed_commands  # noqa: E40
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     print(f"İzinli komutlar: {', '.join(list_allowed_commands())}\n")
 
     all_ok = True
