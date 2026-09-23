@@ -305,6 +305,21 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "system_scan_and_repair",
+        "description": (
+            "Scans every project Python module by actually importing it in an isolated "
+            "subprocess to catch real runtime and missing-dependency errors, checks every "
+            "pyproject.toml-declared dependency's installed version for compatibility, and "
+            "automatically installs or upgrades anything missing or incompatible via pip "
+            "without asking for confirmation. Use when the user asks to check if the system "
+            "or project is healthy, scan for missing dependencies, or self-repair."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {},
+        }
+    },
+    {
         "name": "weather_report",
         "description": "Gives the weather report to user",
         "parameters": {
@@ -1612,6 +1627,11 @@ class JarvisLive:
 
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
+                result = str(r)
+
+            elif name == "system_scan_and_repair":
+                from jarvis.actions.system_scan import system_scan_and_repair
+                r = await loop.run_in_executor(None, system_scan_and_repair)
                 result = str(r)
 
             elif name == "shutdown_jarvis":

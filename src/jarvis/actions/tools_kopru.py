@@ -76,6 +76,11 @@ def _call_system_status(parameters: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in status.items())
 
 
+def _call_system_scan_and_repair(parameters: dict) -> str:
+    from jarvis.actions.system_scan import system_scan_and_repair
+    return system_scan_and_repair(parameters=parameters)
+
+
 def _call_computer_settings(parameters: dict) -> str:
     from jarvis.actions.computer_settings import computer_settings
     # agent_loop asla kendi kendine confirmed=yes gecemez - bu satir
@@ -153,6 +158,7 @@ ALLOWED_TOOLS: dict[str, Any] = {
     "web_search":          _call_web_search,
     "weather_report":      _call_weather_report,
     "system_status":       _call_system_status,
+    "system_scan_and_repair": _call_system_scan_and_repair,
     "computer_settings":   _call_computer_settings,
     "send_message":        _call_send_message,
     "github_arama":        _call_github_arama,
@@ -181,6 +187,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "web_search":        "query: string; mode: 'search'|'news'|'research'|'price' (opsiyonel)",
     "weather_report":    "city: string",
     "system_status":     "parametre gerekmez - CPU/RAM/GPU/sicaklik bilgisi doner",
+"system_scan_and_repair": "parametre gerekmez - projenin tum python dosyalarini gercekten import ederek calisma zamani hatalarini tarar, pyproject.toml bagimliliklarinin surum uyumunu kontrol eder ve eksik/uyumsuz olanlari onay istemeden otomatik kurar",
     "computer_settings": "action: volume/brightness/wifi gibi TEK bir OS ayari; description; value (opsiyonel). shutdown/restart/lock_screen YIKICI sayilir.",
     "send_message":      "receiver; message_text; platform (whatsapp/telegram/vb.) - kullanici adina disariya mesaj gittigi icin HER ZAMAN once onay ister.",
     "github_arama":      "query: string; min_stars (opsiyonel); max_results (opsiyonel) - GitHub'da salt-okunur depo arar, hicbir sey indirmez.",
