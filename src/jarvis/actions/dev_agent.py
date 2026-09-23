@@ -214,7 +214,7 @@ Return ONLY valid JSON — no markdown, no explanation:
     {{
       "path": "main.py",
       "description": "Entry point — what it does and which modules it imports",
-      "imports": ["utils.helpers", "jarvis.core.engine"]
+      "imports": ["utils.helpers", "core.database"]
     }},
     {{
       "path": "utils/helpers.py",
@@ -241,6 +241,7 @@ Critical rules:
 6. Standard library modules (os, sys, json, etc.) do NOT go in "dependencies".
 7. CRITICAL for correctness: if two or more files exchange a data structure (a dict, a class instance, a tuple shape) — even files that never import each other, because the data actually flows through a third file like main.py — describe its EXACT shape ONCE in "shared_data_contracts" (field names, types, whether it's a dict or a specific class). Every file that touches this data MUST use the identical shape. This is the most common source of real bugs: e.g. one file builds {{"amount": ..., "category": ...}} while another expects an object with .amount/.category attributes.
 8. If running the entry point is supposed to durably create or update a file (a database, a report, an exported document, a log, a generated image, etc.), list each such file's relative path in "expected_outputs" with a one-line description of what a CORRECT result looks like inside it. Leave this list EMPTY only for purely interactive/display-only programs that persist nothing (e.g. a calculator, a GUI that only shows numbers on screen). This is critical: a program can run to completion with NO Python error while silently producing nothing real (a network call that fails silently, a thread that never runs, wrong file path) — "expected_outputs" is what lets that be caught instead of wrongly reported as a success.
+9. This is a completely standalone, independent project with NO relationship to any AI assistant framework. NEVER plan a file path or an import under a top-level name "jarvis" (e.g. "jarvis/core/engine.py", or importing "jarvis.anything") — that name does not exist for this project and is never a real requirement, no matter what the description mentions.
 
 JSON:"""
 
@@ -254,6 +255,56 @@ JSON:"""
         if _is_rate_limit(e):
             raise RateLimitError(str(e)) from e
         raise
+
+def _sanitize_plan_against_self_reference(plan: dict) -> dict:
+    """Model bazen urettigi projenin dosya YAPISINA bile kendi calisma
+    ortaminin adini ("jarvis") bir dosya/paket gibi sizdiriyor - ornegin
+    dogrudan "jarvis/core/engine.py" diye BIR DOSYA planliyor ve baska
+    dosyalarin "imports" listesine "jarvis.core.engine" ekliyor.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 4. VE 5. canli web_scraper
+    testlerinde bu IKI FARKLI SEKILDE gerceklesti: once sadece main.py
+    icinde tek satirlik bir halusinasyon-import olarak (Patch 7 bunu
+    yazim asamasinda engelliyor), sonra planin KENDISINDE gercek bir
+    dosya olarak ("jarvis/core/engine.py" planlanip diske yazildi). Bu
+    IKINCI durum COK DAHA KOTU: _classify_error, "jarvis/" klasoru
+    projenin GERCEKTEN kendi (yerel) klasoru oldugunu goruyor (cunku artik
+    gercekten var) ve "local_import_error" olarak siniflandirip sadece
+    eksik __init__.py eklemeyi deniyor - bu ASLA gercek sorunu cozmuyor
+    (ayni traceback 5 denemenin 5'inde de degismeden tekrarlandi, cunku
+    projenin calistigi Python yorumlayicisinda GERCEK "jarvis" paketi
+    (JARVIS'in kendi kod tabani) zaten kurulu/erisilebilir olabiliyor ve
+    yerel sahte "jarvis/" klasoruyle CATISIYOR). Bu fonksiyon, planlama
+    ANINDA - herhangi bir dosya diske yazilmadan ONCE - "jarvis" adini
+    tasiyan TUM dosyalari ve TUM importlari plandan deterministik olarak
+    temizler; boylece _write_file'a bu hatali bilgi hic ulasmaz."""
+    files = plan.get("files", [])
+    kept_files: list[dict] = []
+    dropped_paths: list[str] = []
+    for f in files:
+        path = f.get("path", "") if isinstance(f, dict) else ""
+        top = path.split("/")[0].split("\\")[0] if path else ""
+        top_no_ext = top[:-3] if top.lower().endswith(".py") else top
+        if top_no_ext.lower() == "jarvis":
+            dropped_paths.append(path)
+            continue
+        kept_files.append(f)
+
+    if not dropped_paths:
+        return plan
+
+    print(f"[DevAgent] ⚠️ Plan, bu projeye ait olmayan sahte 'jarvis' dosyaları içeriyordu, kaldırıldı: {dropped_paths}")
+    for f in kept_files:
+        if isinstance(f, dict) and f.get("imports"):
+            f["imports"] = [
+                imp for imp in f["imports"]
+                if not (isinstance(imp, str) and (imp == "jarvis" or imp.startswith("jarvis.")))
+            ]
+
+    new_plan = dict(plan)
+    new_plan["files"] = kept_files
+    return new_plan
+
 
 def _safe_project_path(project_dir: Path, file_path: str) -> "Path | None":
     """DUZELTME (denetim bulgusu F-02): planlayici/duzeltme modelinin urettigi
@@ -312,7 +363,132 @@ def _check_expected_outputs(project_dir: Path, expected_outputs: list, run_start
     return problems
 
 
-def _format_output_problem_message(run_output: str, problems: list[str]) -> str:
+def _detect_manual_trigger_only(source: str) -> list[str]:
+    """GUI callback'lerinin SADECE bir dugme/etkilesime baglanip, programin
+    kendisi tarafindan hicbir zaman otomatik cagrilmadigini tespit etmeye
+    calisir (best-effort, deterministik, LLM'e sormadan - yanlis pozitif
+    vermemeye ozen gosterir, emin olunamayan durumda sessizce bos liste
+    doner).
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 2. canli web_scraper testinde, model
+    tum gercek isi bir "Start Scraping" dugmesinin command= callback'inin
+    ARKASINA gizlemisti; dev_agent programi calistirip bekledi ama hicbir
+    dugmeye tiklayamadigi icin 90 saniye sonunda hicbir sey olmamisti. Bu,
+    klasik "sessiz mantik hatasi"ndan FARKLI bir kok neden: kod calisiyor,
+    sadece dev_agent'in otomatik dogrulama yontemiyle asla tetiklenemiyor."""
+    candidates: set[str] = set()
+    for m in re.finditer(r"command\s*=\s*self\.(\w+)", source):
+        candidates.add(m.group(1))
+    for m in re.finditer(r"command\s*=\s*(\w+)\b(?!\.)", source):
+        candidates.add(m.group(1))
+    for m in re.finditer(r"\.bind\([^,]+,\s*self\.(\w+)", source):
+        candidates.add(m.group(1))
+
+    orphans = []
+    for name in candidates:
+        without_wiring = re.sub(rf"command\s*=\s*(?:self\.)?{re.escape(name)}\b", "", source)
+        without_wiring = re.sub(rf"\.bind\([^,]+,\s*self\.{re.escape(name)}\b", "", without_wiring)
+        direct_call_pattern = re.compile(rf"(?<!def ){re.escape(name)}\s*\(")
+        if not direct_call_pattern.search(without_wiring):
+            orphans.append(name)
+    return orphans
+
+
+_FILE_WRITE_LITERAL_PATTERNS = [
+    re.compile(r"sqlite3\.connect\(\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\bDatabaseManager\(\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\bdb_path\s*[:=]\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\bopen\(\s*['\"]([^'\"]+\.(?:db|sqlite3?|csv|json|xlsx|txt|log))['\"]"),
+    re.compile(r"\.to_csv\(\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\.to_excel\(\s*['\"]([^'\"]+)['\"]"),
+    re.compile(r"\.save\(\s*['\"]([^'\"]+)['\"]"),
+]
+
+
+def _find_referenced_file_literals(source: str) -> set[str]:
+    """Kod icinde gecen, bir dosyaya YAZMAK icin kullanilan string
+    literal'leri (sqlite3.connect("x.db") gibi) toplar - best-effort,
+    URL'leri ve cok kisa/anlamsiz esleşmeleri eler."""
+    found: set[str] = set()
+    for pattern in _FILE_WRITE_LITERAL_PATTERNS:
+        for m in pattern.finditer(source):
+            literal = m.group(1)
+            if literal and len(literal) > 2 and "://" not in literal:
+                found.add(literal)
+    return found
+
+
+def _detect_output_filename_mismatch(expected_outputs: list, all_sources: str) -> list[str]:
+    """Plan'in "expected_outputs" ile soz verdigi dosya adi, YAZILAN kodun
+    HICBIR YERINDE gecmiyorsa ama ayni uzantili BASKA bir dosya adi
+    aciqca kullaniliyorsa, bunu somut bir uyumsuzluk olarak raporlar.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 3. canli web_scraper testinde plan
+    "database.db" bekliyordu, ama _write_file() bu beklentiyi HIC
+    gormedigi icin (sadece shared_data_contracts aliyordu, expected_outputs
+    degil) kendi basina "wikipedia.db" adinda bambaska bir dosyaya yazan
+    kod uretti. _check_expected_outputs() bunu "database.db guncellenmedi"
+    diye doğru tespit etti, ama _fix_files()'a giden mesaj HANGI dosyanin
+    yanlislikla kullanildigini soylemiyordu - bu yuzden LLM 5 denemede de
+    ayni hatayi tekrarladi. Bu fonksiyon, o spesifik ipucunu saglar."""
+    if not expected_outputs or not all_sources:
+        return []
+    referenced = _find_referenced_file_literals(all_sources)
+    mismatches: list[str] = []
+    for item in expected_outputs:
+        rel_path = item.get("path") if isinstance(item, dict) else str(item)
+        if not rel_path:
+            continue
+        expected_name = Path(rel_path).name
+        if expected_name in all_sources or rel_path in all_sources:
+            continue
+        expected_ext = Path(expected_name).suffix.lower()
+        alt_candidates = sorted({
+            r for r in referenced
+            if expected_ext and Path(r).suffix.lower() == expected_ext and Path(r).name != expected_name
+        })
+        if alt_candidates:
+            mismatches.append(
+                f"expected output '{rel_path}' does not appear ANYWHERE in the "
+                f"source code, but the code writes to a differently-named file "
+                f"with the same extension instead: {', '.join(alt_candidates)}."
+            )
+    return mismatches
+
+
+_BLOCKING_DIALOG_PATTERN = re.compile(
+    r"\b(?:messagebox\.(?:showinfo|showerror|showwarning|askyesno|askokcancel|"
+    r"askretrycancel|askquestion|askyesnocancel)|simpledialog\.ask\w*)\s*\("
+)
+
+
+def _detect_blocking_dialog_calls(source: str) -> list[str]:
+    """Giris dosyasinin otomatik calisan yolunda (mainloop() BASLAMADAN once,
+    ya da mainloop() hic olmadan calisan bir betikte) tkinter'in modal
+    dialog fonksiyonlarindan (messagebox.showinfo/showerror/askyesno vb.,
+    simpledialog.ask...) biri cagriliyorsa bunu tespit eder - bu
+    fonksiyonlar bir INSAN tiklayana KADAR surecin kendisini bloke eder.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 6. canli web_scraper testinde
+    main.py, tum GERCEK Tkinter arayuzunu (ilerleme cubugu, log kutusu -
+    ayri bir gui/app.py dosyasinda duzgunce yazilmisti) HIC KULLANMADAN,
+    islem bitince dogrudan "messagebox.showinfo(...)" cagiriyordu. Bu,
+    hicbir Tk() penceresi/mainloop() olmadan bile GERCEK bir modal
+    pencere acip _get_temp_root() ile kendi ic donguisunu baslatiyor ve
+    kimse tiklamadigi icin sonsuza kadar (dev_agent'in zaman asimina
+    kadar) bekliyor - iki ayri zaman asimi (30sn sonra 90sn) da bununla
+    tam olarak eslesiyor. _detect_manual_trigger_only bunu YAKALAYAMAZ
+    (bir dugmeye baglanmis bir fonksiyon degil, dogrudan cagrilan bir
+    fonksiyon) - bu yuzden ayri, tamamlayici bir tespit gerekiyor."""
+    return sorted(set(_BLOCKING_DIALOG_PATTERN.findall(source)))
+
+
+def _format_output_problem_message(
+    run_output: str,
+    problems: list[str],
+    entry_source: str = "",
+    filename_mismatches: list[str] | None = None,
+) -> str:
     """"Sessiz basarisizlik" (program cokmedi ama soz verilen ciktiyi
     uretmedi) durumunu, _fix_files'a (LLM tabanli genel duzeltmeye) gercekten
     yardimci olacak somut bir teshis mesajina cevirir. Asagidaki olasi
@@ -320,11 +496,68 @@ def _format_output_problem_message(run_output: str, problems: list[str]) -> str:
     sinifllardir - varsayimsal degildir."""
     problems_text = "\n".join(f"  - {p}" for p in problems)
     output_excerpt = run_output[:800].strip() if run_output and run_output.strip() else "(no output at all)"
+
+    mismatch_note = ""
+    if filename_mismatches:
+        mismatch_lines = "\n".join(f"  - {m}" for m in filename_mismatches)
+        mismatch_note = (
+            f"\n\nSTRONG SUSPECT (filename mismatch):\n{mismatch_lines}\n"
+            "This is very likely just a wrong filename/path hardcoded somewhere "
+            "(a constructor default argument, a sqlite3.connect(...) call, an "
+            "open(...) call, etc.). Search EVERY file for where this path is "
+            "opened/created and change it to the EXACT required name — do not "
+            "invent or keep a differently-named file."
+        )
+
+    blocking_dialog_note = ""
+    if entry_source:
+        dialog_calls = _detect_blocking_dialog_calls(entry_source)
+        if dialog_calls:
+            names = ", ".join(c.rstrip("(") for c in dialog_calls)
+            blocking_dialog_note = (
+                f"\n\nSTRONG SUSPECT (blocking dialog): the entry point calls "
+                f"{names} directly. These tkinter dialog functions open a REAL "
+                "modal window and block the calling code until a human clicks "
+                "a button on it — even if no Tk() root/mainloop() exists yet, "
+                "one is created implicitly. This program will be run and "
+                "observed automatically with NO human available to click "
+                "anything, so it will hang until timeout. Do not call these "
+                "from the automatic startup path — log results to the "
+                "console or a log widget instead, and only show such a "
+                "dialog in response to a real user-initiated action."
+            )
+
+    manual_trigger_note = ""
+    if entry_source:
+        orphan_handlers = _detect_manual_trigger_only(entry_source)
+        if orphan_handlers:
+            names = ", ".join(orphan_handlers)
+            manual_trigger_note = (
+                f"\n\nSTRONG SUSPECT: the function(s) {names} appear to be wired "
+                "ONLY to a button click or event binding, and are never invoked "
+                "anywhere else in the entry point. This program will be run and "
+                "observed automatically with NO human available to click "
+                "anything or type input. If the project description gives "
+                "concrete parameters (a fixed count, specific data, etc.), make "
+                f"the entry point call {names} AUTOMATICALLY on startup (e.g. "
+                "right after building the window, or via root.after(100, ...)) "
+                "so the real work happens without waiting for a click, while "
+                "still leaving the button there for a human to use later."
+            )
+
+    # ONEMLI: manual_trigger_note (varsa) - en somut/eyleme donusturulebilir
+    # ipucu - genel neden listesinden ONCE gelmeli. SEBEP: _build_project son
+    # "basaramadim" mesajinda last_output'u 600 karaktere KESIYOR - once ilk
+    # patch5 testinde bu spesifik ipucu, uzun genel liste yuzunden tam da
+    # kesilen kisma dusup kullaniciya hic ulasmiyordu.
     return (
         "NO PYTHON ERROR OCCURRED, but the program did not produce the output "
         "it was supposed to produce:\n"
-        f"{problems_text}\n\n"
-        "This is a SILENT/LOGIC bug, not a crash - look for causes like: a "
+        f"{problems_text}"
+        f"{mismatch_note}"
+        f"{blocking_dialog_note}"
+        f"{manual_trigger_note}\n\n"
+        "Other possible causes if the above suspect doesn't apply: a "
         "blocking call (e.g. using ThreadPoolExecutor as a context manager, "
         "which waits for the task to finish before a GUI's mainloop() can "
         "even start) that prevents real work from ever happening; a network "
@@ -332,9 +565,13 @@ def _format_output_problem_message(run_output: str, problems: list[str]) -> str:
         "real sites, including Wikipedia, reject a plain requests.get() with "
         "no User-Agent) with the exception swallowed and never surfaced; "
         "wrong assumptions about an external page/API's structure; writing "
-        "to the wrong working directory or file path; or a retry loop that "
+        "to the wrong working directory or file path; a retry loop that "
         "looks like it retries but never actually re-attempts the failed "
-        "operation. Fix the actual logic, not just the error message.\n\n"
+        "operation; or a persistence/processing function described in "
+        "another file (e.g. one that says it saves data) that is declared "
+        "but never actually called from the entry point, with a separate, "
+        "incomplete reimplementation used instead. Fix the actual logic, "
+        "not just the error message.\n\n"
         "Actual console output from the run (may look harmless even though "
         "nothing was produced):\n"
         f"{output_excerpt}"
@@ -349,6 +586,7 @@ def _write_file(
     project_dir: Path,
     already_written: dict[str, str],
     shared_contracts: str = "",
+    expected_outputs: str = "",
 ) -> str:
     model = _get_model(MODEL_WRITER)
 
@@ -391,6 +629,14 @@ JS/TS-specific rules:
         + shared_contracts
     ) if shared_contracts else ""
 
+    expected_outputs_block = (
+        "Files this project MUST create or update on disk when it runs, with the "
+        "EXACT relative path required (any file/database/log path you write in this "
+        "code must match one of these paths character-for-character — never invent "
+        "a different filename, even one that seems more fitting to the project's "
+        "theme):\n" + expected_outputs
+    ) if expected_outputs else ""
+
     prompt = f"""You are a senior {language} developer writing production-quality code for a real project.
 
 Project goal: {project_description}
@@ -401,6 +647,8 @@ Complete project file structure (in dependency order):
 {f"Dependencies this file must import from other project files:{dependency_context}" if dependency_context else ""}
 
 {shared_contracts_block}
+
+{expected_outputs_block}
 
 Your task: Write the complete, working code for: {file_path}
 Purpose of this file: {file_desc}
@@ -415,6 +663,13 @@ General rules:
 - Match import paths EXACTLY to the file paths in the project structure (e.g. if file is "utils/helpers.py", import as "from utils.helpers import ...").
 - Use proper error handling (try/except) where I/O or network calls are made.
 - The code must work correctly when the project entry point is run from the project root directory.
+- If the project description gives concrete parameters (a fixed count, specific data, "save results to a database/file", etc.), the entry point must PERFORM that exact behavior AUTOMATICALLY as soon as the program starts — do not gate it behind a manual UI action (typing into a field, clicking a "Start" button) unless the description explicitly asks for manual/interactive input. This code will be verified by launching it and observing real output, with NO human available to click or type anything. A button/field may still be ADDED on top for a human to use later, but the described core behavior must also run by itself on startup.
+- If another project file's description says it exposes a function (e.g. one that saves/persists data), the entry point must CALL that exact function — never leave it unused, and never silently reimplement its logic inline instead of calling it.
+- If a list of required output file paths is given above, every place in this file that opens/creates/connects to a database or file for writing must use one of those EXACT paths — do not default to, invent, or fall back to any other filename.
+- This is a completely standalone, independent program with NO relationship to any AI assistant framework. NEVER import a package named "jarvis" or anything resembling it, and never assume any "jarvis"-namespaced module is available — it does not exist in this project and is not a real installable dependency. Implement any needed functionality (saving data, calling an API, etc.) directly within this project's own files.
+- If you use any submodule of a standard library package that is not automatically available from a bare "import X as y" (for example tkinter's ttk, filedialog, messagebox, simpledialog, colorchooser, font, scrolledtext — each needs its own explicit "from tkinter import ttk" style import), you MUST add that explicit import — do not assume importing the parent package makes its submodules' names available.
+- NEVER call a blocking modal dialog function (tkinter's messagebox.showinfo/showerror/showwarning/askyesno/askokcancel/etc., or simpledialog.ask...) from the automatic startup path — these open a real window and block execution until a human clicks it, and this program will be run and observed automatically with no human available to click anything. Print results to the console or a log widget instead; only show such a dialog in direct response to a real user-initiated action (e.g. inside a button's own callback), never unconditionally on startup or at the end of automatic processing.
+- If a GUI file (Tkinter, etc.) is one of this project's OTHER files, and the description calls for a graphical interface, the entry point must actually instantiate and run that GUI (create its window class and call its mainloop) — never write a separate headless/console version of the same logic in the entry point that ignores the GUI file, leaving it unused.
 
 Code for {file_path}:"""
 
@@ -724,6 +979,62 @@ def _try_fix_typing_import(error_output: str, project_dir: Path, project_files: 
     return True
 
 
+_TKINTER_SUBMODULES = frozenset({
+    "ttk", "filedialog", "messagebox", "simpledialog", "colorchooser",
+    "font", "scrolledtext", "dnd",
+})
+
+
+def _try_fix_tkinter_submodule_import(error_output: str, project_dir: Path, project_files: list[str]) -> bool:
+    """'NameError: name 'X' is not defined' hatasi, X gercekten yaygin bir
+    tkinter ALT MODULU ise (ttk, filedialog, messagebox, vb.), LLM'e tekrar
+    sormadan DOGRUDAN, deterministik bir metin islemiyle duzeltir:
+    "from tkinter import X" satirini ekler. _try_fix_typing_import ile
+    AYNI mantik/desen, sadece typing yerine tkinter alt-modulleri icin.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki 4. canli web_scraper testinde model
+    "ttk.Progressbar(...)" yazdi ama "import tkinter as tk" YAPMANIN
+    "ttk"yi otomatik erisilir kilmadigini (ayrica "from tkinter import ttk"
+    gerektigini) atladi. _fix_files (LLM tabanli, tum dosyayi yeniden
+    yazan) bu TEK SATIRLIK eksikligi İKİ AYRI DÜZELTME DENEMESİNDE de
+    (attempt 2 ve attempt 3, birebir ayni traceback ile) gideremedi -
+    _try_fix_typing_import'un typing icin zaten cozdugu sorunun BİREBİR
+    AYNISI, sadece farkli bir modul icin."""
+    match = re.search(r"NameError: name ['\"](\w+)['\"] is not defined", error_output)
+    if not match:
+        return False
+    missing_name = match.group(1)
+    if missing_name not in _TKINTER_SUBMODULES:
+        return False
+
+    error_file, _ = _parse_traceback(error_output, project_files)
+    if not error_file:
+        return False
+    full_path = _safe_project_path(project_dir, error_file)
+    if full_path is None or not full_path.is_file():
+        return False
+
+    file_text = full_path.read_text(encoding="utf-8")
+    already_ok_patterns = [
+        rf"from tkinter import[^\n]*\b{missing_name}\b",
+        rf"import tkinter\.{missing_name}\b",
+    ]
+    if any(re.search(p, file_text) for p in already_ok_patterns):
+        return False  # zaten import edilmis - baska bir sey bozuk, burada cozulemez
+
+    import_pattern = re.compile(r"^import tkinter as tk$", re.MULTILINE)
+    existing = import_pattern.search(file_text)
+    new_line = f"from tkinter import {missing_name}"
+    if existing:
+        file_text = file_text[:existing.end()] + "\n" + new_line + file_text[existing.end():]
+    else:
+        file_text = f"{new_line}\n" + file_text
+
+    full_path.write_text(file_text, encoding="utf-8")
+    print(f"[DevAgent] 🔧 Eksik 'tkinter.{missing_name}' importu otomatik eklendi ({error_file}).")
+    return True
+
+
 def _try_fix_bad_symbol_import(error_output: str, project_dir: Path, project_files: list[str]) -> bool:
     """'ImportError: cannot import name 'X' from 'Y'' hatasini, LLM'e
     sormadan, deterministik bir AST analiziyle duzeltmeyi dener.
@@ -868,6 +1179,19 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
         return False
 
     module_name = match.group(1).split(".")[0]
+
+    # GUVENLIK/HIZ (2026-09-23, 4. canli web_scraper testi): model bazen
+    # ureteceği bagimsiz projenin icine, kendi calisma ortaminin adi olan
+    # "jarvis"i (ornegin "import jarvis.core.engine as engine") halusinasyon
+    # olarak yaziyor. Bu ASLA gercek, pip ile kurulabilir harici bir paket
+    # DEGILDIR - kurmaya calismak sadece zaman kaybettirir ve "wheel build"
+    # hatasiyla kullanicida yanlis bir "kurulum bozuk" izlenimi birakir.
+    # Boyle bir import, _fix_files'in LLM tabanli genel duzeltmesine
+    # birakilmali (o da zaten bu importu kaldirmayi genelde basariyor).
+    if module_name.lower() == "jarvis":
+        print("[DevAgent] ⚠️ 'jarvis' harici bir paket değil, bu projeye YANLIŞLIKLA eklenmiş bir import olmalı - kurulum denenmeyecek.")
+        return False
+
     pkg = _IMPORT_TO_PYPI.get(module_name.lower(), module_name.replace("_", "-"))
     print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg} (import: {module_name})")
     try:
@@ -911,12 +1235,19 @@ def _fix_files(
     project_dir: Path,
     entry_point: str,
     shared_contracts: str = "",
+    expected_outputs: str = "",
+    known_error_type: str = "",
 ) -> dict[str, str]:
 
     model = _get_model(MODEL_PLANNER)
 
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
-    error_type = _classify_error(error_output)
+    # ONEMLI: "output_missing" _classify_error()'un kendi sozlugunde YOKTUR -
+    # sadece _build_project()'in dis dongusunde uretilen yapay bir etiket.
+    # known_error_type verilmisse (ozellikle output_missing icin) ONA
+    # guveniyoruz; yoksa (dogrudan/test amacli cagrilarda) eskisi gibi
+    # error_output metnini kendimiz siniflandiriyoruz.
+    error_type = known_error_type or _classify_error(error_output)
     web_context = _search_error_context(error_output)
 
     files_to_fix: list[str] = []
@@ -929,6 +1260,21 @@ def _fix_files(
                     p = fi["path"]
                     if p not in files_to_fix:
                         files_to_fix.append(p)
+    elif error_type == "output_missing":
+        # DUZELTME (2026-09-23, 3. canli web_scraper testi): "output_missing"
+        # durumunda gercek hatanin GIRIS DOSYASINDA olacagi varsayimi HER ZAMAN
+        # dogru degil - bir onceki calistirmada asil kusurlu satir (yanlis db
+        # dosya adi, sahte retry, vs.) database.py/helpers.py gibi baska bir
+        # dosyada da olabilir. Traceback olmadigi icin _parse_traceback hicbir
+        # sey bulamaz; sadece entry_point'i duzeltmeye calismak, hata GERCEKTEN
+        # baska bir dosyadaysa 5 denemeyi de bosa harcar. Bu yuzden entry_point
+        # ile birlikte, kalicilik/veri yazma ile ilgili anahtar kelimeler
+        # gecen TUM dosyalari da adaylara ekliyoruz.
+        files_to_fix.append(entry_point)
+        _persistence_hints = ("sqlite3", ".db", "open(", "to_csv", "to_excel", "json.dump", "save_to", "requests.post")
+        for fp, code in file_codes.items():
+            if fp != entry_point and any(hint in code for hint in _persistence_hints):
+                files_to_fix.append(fp)
     else:
         files_to_fix.append(entry_point)
 
@@ -951,6 +1297,13 @@ def _fix_files(
             "Shared data contracts ALL files must follow EXACTLY:\n" + shared_contracts
         ) if shared_contracts else ""
 
+        expected_outputs_block = (
+            "Files this project MUST create or update on disk when it runs, with the "
+            "EXACT relative path required (never write to a different filename than "
+            "these, even one that seems more fitting to the project's theme):\n"
+            + expected_outputs
+        ) if expected_outputs else ""
+
         prompt = f"""You are an expert {language} debugger. Fix the broken file below.
 
 Project goal: {project_description}
@@ -962,6 +1315,8 @@ Other files for context (read-only — fix only the target file):
 {other_ctx[:3500]}
 
 {shared_contracts_block}
+
+{expected_outputs_block}
 
 File to fix: {fix_path}{line_hint}
 Error type: {error_type}
@@ -978,6 +1333,9 @@ Rules:
 - Keep all existing correct logic — do not remove working features.
 - Ensure import paths match the actual project file structure exactly.
 - Do NOT introduce new bugs or remove error handling.
+- Double-check: every name you use that comes from a module (tk.ttk, filedialog, messagebox, etc.) must have its own explicit import statement — "import tkinter as tk" alone does NOT make "ttk" or other submodules available as bare names.
+- NEVER import a package named "jarvis" or anything resembling it — this is a standalone project with no relationship to any AI assistant framework, and no such package exists here.
+- NEVER call a blocking modal dialog function (messagebox.showinfo/showerror/askyesno/etc., simpledialog.ask...) from the automatic startup path — it opens a real window and blocks forever waiting for a human click that will never come during automated verification. Print/log instead.
 
 Fixed code for {fix_path}:"""
 
@@ -1036,6 +1394,8 @@ def _build_project(
         if speak: speak(msg)
         return msg
 
+    plan = _sanitize_plan_against_self_reference(plan)
+
     proj_name    = project_name or plan.get("project_name", "jarvis_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
     project_dir  = PROJECTS_DIR / proj_name
@@ -1047,6 +1407,11 @@ def _build_project(
     dependencies = plan.get("dependencies", [])
     shared_contracts_text = "\n".join(f"- {c}" for c in plan.get("shared_data_contracts", []) if c)
     expected_outputs = plan.get("expected_outputs", [])
+    expected_outputs_text = "\n".join(
+        f"- {(o.get('path') if isinstance(o, dict) else str(o))}"
+        + (f": {o.get('description', '')}" if isinstance(o, dict) and o.get("description") else "")
+        for o in expected_outputs if o
+    )
 
     log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
 
@@ -1073,6 +1438,7 @@ def _build_project(
                     project_dir=project_dir,
                     already_written=file_codes,
                     shared_contracts=shared_contracts_text,
+                    expected_outputs=expected_outputs_text,
                 )
                 file_codes[file_path] = code
                 time.sleep(0.4)
@@ -1154,7 +1520,14 @@ def _build_project(
         )
         if output_problems:
             log(f"Program çökmedi ama beklenen çıktı üretilmedi: {output_problems}")
-            last_output = _format_output_problem_message(last_output, output_problems)
+            filename_mismatches = _detect_output_filename_mismatch(
+                expected_outputs, "\n".join(file_codes.values())
+            )
+            if filename_mismatches:
+                log(f"Dosya adı uyuşmazlığı tespit edildi: {filename_mismatches}")
+            last_output = _format_output_problem_message(
+                last_output, output_problems, file_codes.get(entry_point, ""), filename_mismatches
+            )
 
         if not has_crash_error and not output_problems:
             if is_timeout:
@@ -1207,6 +1580,12 @@ def _build_project(
                 time.sleep(1)
                 continue
 
+            fixed_tkinter = _try_fix_tkinter_submodule_import(last_output, project_dir, list(file_codes.keys()))
+            if fixed_tkinter:
+                log("Eksik 'tkinter' alt-modul importu otomatik eklendi (model cagrilmadan), tekrar deneniyor...")
+                time.sleep(1)
+                continue
+
         if error_type == "import_error":
             fixed_symbol = _try_fix_bad_symbol_import(last_output, project_dir, list(file_codes.keys()))
             if fixed_symbol:
@@ -1225,6 +1604,8 @@ def _build_project(
                 project_dir=project_dir,
                 entry_point=entry_point,
                 shared_contracts=shared_contracts_text,
+                expected_outputs=expected_outputs_text,
+                known_error_type=error_type,
             )
             file_codes.update(updated)
             time.sleep(1)
