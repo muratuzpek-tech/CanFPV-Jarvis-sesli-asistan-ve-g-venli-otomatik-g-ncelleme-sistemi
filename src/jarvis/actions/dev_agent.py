@@ -833,6 +833,46 @@ def _is_dangerous_run_command(run_command: str) -> str | None:
     return None
 
 
+def _read_partial_timeout_output(out_path: Path, err_path: Path, max_chars: int = 1500) -> str:
+    """Yama 19: bir 'Timed out' donusunden ONCE, surec zaten oldurulmus olsa
+    bile stdout.log/stderr.log dosyalarinda o ana kadar ne yazildiysa
+    OKUMAYA calisir - GERCEK bir canli testte (11. test, WikipediaScraper,
+    2026-09-24) bulunan bosluk: _run_project'in timeout dalı bu dosyalari
+    HIC OKUMUYORDU, sadece sabit 'Timed out after Ns...' metnini
+    donduruyordu - surekli calisan bir GUI/thread uygulamasinda arka plan
+    thread'inin SESSIZCE yakalayip print ettigi GERCEK hatalar (orn. "SQLite
+    objects created in a thread can only be used in that same thread" -
+    App.__init__'te ana thread'de acilan bir sqlite3 baglantisinin, daha
+    sonra threading.Thread ile baslatilan bir arka plan is parcaciginda
+    kullanilmasi) hicbir zaman modele ulasmiyordu; _fix_files 3 tam dongu
+    boyunca gercek ipucundan tamamen habersiz, kor kor tahmin yurutmek
+    zorunda kaliyordu. Bu, 403 Forbidden (Yama 17) ile AYNI temel desen:
+    yakalanip yazdirilan ama hicbir zaman traceback olarak firlatilmayan
+    bir hata - farkli olarak burada sorun dosya-hedefleme degil, hatanin
+    fixer'a ULASIP ULASMADIGI (gorunurluk).
+    ONEMLI: surekli calisan (asla kendiliginden bitmeyen) bir GUI/sunucu
+    icin bu KISMEN yazilmis, olasilikla YARIM KALMIS bir ciktidir - taninmis
+    bir hata FORMATINI (traceback, "Error: ...") ARIYORSAK bile bu kismi
+    olmasi sorun degil, cunku amac SADECE bir ipucu yakalayabilmek."""
+    parts = []
+    for label, path in (("STDOUT", out_path), ("STDERR", err_path)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text:
+            parts.append(f"{label}:\n{text}")
+    if not parts:
+        return ""
+    excerpt = "\n\n".join(parts)[:max_chars]
+    # NOT: bu aciklama cumlesi KASITLI OLARAK kisa - _format_output_problem_message
+    # asagida bu tum metni SADECE ILK 800 KARAKTERE kesiyor; uzun bir on-yazi,
+    # asil ipucu olan gercek hata satirini tam da o kesim noktasina itebilirdi.
+    return (
+        f"\n\nPartial output before kill (may reveal a silent background error):\n{excerpt}"
+    )
+
+
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
 
@@ -895,7 +935,11 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
                     proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     _kill_process_tree(proc)
-                    result_text = f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
+                    partial_excerpt = _read_partial_timeout_output(out_path, err_path)
+                    result_text = (
+                        f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
+                        f"{partial_excerpt}"
+                    )
 
             if result_text is not None:
                 return result_text
