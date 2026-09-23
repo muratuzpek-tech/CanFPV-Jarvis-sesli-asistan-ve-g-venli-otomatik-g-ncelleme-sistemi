@@ -1285,8 +1285,8 @@ def _add_missing_request_timeouts(source: str, default_timeout: int = 10) -> "tu
     # bkz. asagidaki geriye-dogru-virgul-kontrolu).
     src_lines = source.splitlines(keepends=True)
     line_start_offsets = [0]
-    for l in src_lines:
-        line_start_offsets.append(line_start_offsets[-1] + len(l))
+    for src_line in src_lines:
+        line_start_offsets.append(line_start_offsets[-1] + len(src_line))
 
     def _to_offset(lineno: int, col: int) -> int:
         return line_start_offsets[lineno - 1] + col
