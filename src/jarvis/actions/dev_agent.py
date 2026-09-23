@@ -671,6 +671,8 @@ General rules:
 - If you use any submodule of a standard library package that is not automatically available from a bare "import X as y" (for example tkinter's ttk, filedialog, messagebox, simpledialog, colorchooser, font, scrolledtext — each needs its own explicit "from tkinter import ttk" style import), you MUST add that explicit import — do not assume importing the parent package makes its submodules' names available.
 - NEVER call a blocking modal dialog function (tkinter's messagebox.showinfo/showerror/showwarning/askyesno/askokcancel/etc., or simpledialog.ask...) from the automatic startup path — these open a real window and block execution until a human clicks it, and this program will be run and observed automatically with no human available to click anything. Print results to the console or a log widget instead; only show such a dialog in direct response to a real user-initiated action (e.g. inside a button's own callback), never unconditionally on startup or at the end of automatic processing.
 - If a GUI file (Tkinter, etc.) is one of this project's OTHER files, and the description calls for a graphical interface, the entry point must actually instantiate and run that GUI (create its window class and call its mainloop) — never write a separate headless/console version of the same logic in the entry point that ignores the GUI file, leaving it unused.
+- EVERY network call (requests.get/post/put/delete/patch, a requests.Session's own get/post/etc., urllib, httpx, etc.) MUST include an explicit timeout (e.g. requests.get(url, timeout=10)). Never call a network function with no timeout — a single slow or unresponsive server then blocks the whole program indefinitely with no Python error at all, which will be reported as a silent failure, not a crash.
+- If the description asks for parallel/concurrent/threaded work (e.g. "N paralel thread"), the entry point must actually use the threaded/concurrent implementation — never write a second, sequential version of the same logic and call that one instead, leaving the real parallel implementation unused.
 
 Code for {file_path}:"""
 
@@ -1222,6 +1224,113 @@ def _proactively_fix_cross_file_imports(project_dir: Path, file_codes: dict[str,
     return fixed_paths
 
 
+_REQUESTS_HTTP_METHODS = frozenset({"get", "post", "put", "delete", "patch", "head", "options", "request"})
+
+
+def _add_missing_request_timeouts(source: str, default_timeout: int = 10) -> "tuple[str, int]":
+    """Kaynak kodda DOGRUDAN 'requests.get(...)'/'requests.post(...)' vb.
+    seklinde yapilan HTTP cagrilarinda 'timeout=' parametresi eksikse,
+    guvenli bir varsayilan (default_timeout saniye) ekler. ast.unparse ile
+    tum dosyayi yeniden yazmak yerine, cagrinin GERCEK konumuna (end_col_offset)
+    bakip kapanis parantezinden hemen once metni cerrahi olarak ekler -
+    boylece bicimlendirme/yorumlar bozulmaz.
+
+    GERCEK MOTIVASYON: 2026-09-23'teki web_scraper canli testinde,
+    retry_scrape() 10 URL icin, HER BIRINE 2 deneme hakkiyla, TAMAMEN
+    SIRALI (kullanicinin acikca istedigi paralel/thread'li YERINE) sekilde
+    requests.get(url) cagiriyordu - HICBIR timeout= parametresi olmadan.
+    Bu oturumda zaten gercek ag/VPN baglanti sorunlari GOZLEMLENMISTI; tek
+    bir yavas/askida kalan istek bile, HICBIR Python hatasi ORTAYA
+    CIKMADAN, sadece "database.db guncellenmedi" seklinde sessizce 90
+    saniyelik zaman asimina neden oluyordu - 2 ayri LLM tabanli duzeltme
+    denemesi bile bunu fark edip cozemedi. Bilincli olarak SADECE
+    dogrudan 'requests.X(...)' modul-seviyesi cagrilari hedefleniyor
+    (requests.Session() nesneleri UZERINDEN yapilan cagrilar degil) -
+    boylece hicbir zaman alakasiz bir '.get(...)' cagrisina (bir dict,
+    bir cache, os.environ, vb.) yanlislikla dokunulmaz."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, 0
+
+    # Satir basi offsetlerini ONCEDEN hesapla - (lineno, col) -> mutlak
+    # karakter konumu donusumu icin (cok satirli/sarmalanmis cagrilarda
+    # SADECE o satir icinde calismak, satirlar arasi bir virguldan HEMEN
+    # SONRA gelen kapanis parantezinde CIFT VIRGUL hatasina yol acardi -
+    # bkz. asagidaki geriye-dogru-virgul-kontrolu).
+    src_lines = source.splitlines(keepends=True)
+    line_start_offsets = [0]
+    for l in src_lines:
+        line_start_offsets.append(line_start_offsets[-1] + len(l))
+
+    def _to_offset(lineno: int, col: int) -> int:
+        return line_start_offsets[lineno - 1] + col
+
+    insert_offsets: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "requests"
+            and func.attr in _REQUESTS_HTTP_METHODS
+        ):
+            continue
+        if any(kw.arg == "timeout" for kw in node.keywords):
+            continue
+        if any(kw.arg is None for kw in node.keywords):  # **kwargs yayilimi - dokunma
+            continue
+        if not node.args and not node.keywords:
+            continue
+        end_lineno = getattr(node, "end_lineno", None)
+        end_col = getattr(node, "end_col_offset", None)
+        if end_lineno is None or end_col is None:
+            continue
+        # kapanis ')' karakterinden HEMEN ONCEKI mutlak konum
+        insert_offsets.append(_to_offset(end_lineno, end_col) - 1)
+
+    if not insert_offsets:
+        return source, 0
+
+    result = source
+    for off in sorted(insert_offsets, reverse=True):
+        # DUZELTME: cok satirli (sarmalanmis) bir cagrida son argumanin
+        # zaten sondaki virgulu ("headers=headers,\n)") olabilir - bu
+        # durumda ONUNE bir virgul DAHA eklemek "x,\n, timeout=10)" gibi
+        # CIFT VIRGUL SozdizimiHatasi'na yol acar. Geriye dogru (bosluk/
+        # yeni satirlari atlayarak) bakip zaten bir virgul varsa, sadece
+        # "timeout=N" ekle (bosuna ikinci bir virgul ekleme).
+        j = off - 1
+        while j >= 0 and result[j] in " \t\r\n":
+            j -= 1
+        needs_comma = not (j >= 0 and result[j] == ",")
+        insertion = f", timeout={default_timeout}" if needs_comma else f" timeout={default_timeout}"
+        result = result[:off] + insertion + result[off:]
+
+    return result, len(insert_offsets)
+
+
+def _proactively_add_request_timeouts(project_dir: Path, file_codes: dict[str, str]) -> list[str]:
+    """Proje HENUZ calistirilmadan, TUM dosyalarda dogrudan
+    'requests.get/post/...(...)' seklinde yapilan HTTP cagrilarina, eksikse
+    guvenli bir varsayilan timeout ekler - bkz. _add_missing_request_timeouts
+    docstring'i icin gercek motivasyon."""
+    fixed_paths: list[str] = []
+    for fp, code in list(file_codes.items()):
+        new_code, count = _add_missing_request_timeouts(code)
+        if count:
+            full_path = _safe_project_path(project_dir, fp)
+            if full_path is None or not full_path.is_file():
+                continue
+            full_path.write_text(new_code, encoding="utf-8")
+            file_codes[fp] = new_code
+            fixed_paths.append(fp)
+            print(f"[DevAgent] 🔧 {fp}: {count} adet 'requests' çağrısına eksik 'timeout=' eklendi.")
+    return fixed_paths
+
+
 # Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
 # paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
 # yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
@@ -1549,6 +1658,7 @@ Rules:
 - Double-check: every name you use that comes from a module (tk.ttk, filedialog, messagebox, etc.) must have its own explicit import statement — "import tkinter as tk" alone does NOT make "ttk" or other submodules available as bare names.
 - NEVER import a package named "jarvis" or anything resembling it — this is a standalone project with no relationship to any AI assistant framework, and no such package exists here.
 - NEVER call a blocking modal dialog function (messagebox.showinfo/showerror/askyesno/etc., simpledialog.ask...) from the automatic startup path — it opens a real window and blocks forever waiting for a human click that will never come during automated verification. Print/log instead.
+- EVERY network call (requests.get/post/etc., a Session's own get/post, urllib, httpx...) MUST have an explicit timeout= — a call with none can hang the whole program forever on one slow server with no Python error at all.
 
 Fixed code for {fix_path}:"""
 
@@ -1681,6 +1791,15 @@ def _build_project(
     proactively_fixed = _proactively_fix_cross_file_imports(project_dir, file_codes)
     if proactively_fixed:
         log(f"İlk çalıştırmadan önce {len(proactively_fixed)} dosyadaki import isim uyuşmazlığı proaktif olarak düzeltildi: {proactively_fixed}")
+
+    # DUZELTME (2026-09-23, web_scraper canli testi - bkz.
+    # _add_missing_request_timeouts docstring'i): dogrudan requests.get/post
+    # vb. cagrilarinda timeout= eksikse, ilk calistirmadan once ekle - tek
+    # bir yavas/askida kalan ag istegi, hicbir Python hatasi vermeden
+    # dev_agent'in TUM zaman asimi butcesini (30sn + 90sn) tuketebiliyordu.
+    timeout_fixed = _proactively_add_request_timeouts(project_dir, file_codes)
+    if timeout_fixed:
+        log(f"İlk çalıştırmadan önce {len(timeout_fixed)} dosyadaki eksik HTTP timeout'u proaktif olarak eklendi: {timeout_fixed}")
 
     if dependencies:
         install_result = _install_dependencies(dependencies, project_dir)
