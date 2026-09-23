@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import typing
 from pathlib import Path
 
 
@@ -582,6 +583,55 @@ def _try_fix_local_import(error_output: str, project_dir: Path) -> bool:
     return added_any
 
 
+_TYPING_PUBLIC_NAMES = frozenset(n for n in dir(typing) if not n.startswith("_"))
+
+
+def _try_fix_typing_import(error_output: str, project_dir: Path, project_files: list[str]) -> bool:
+    """'NameError: name 'X' is not defined' hatasi, X gercekten `typing`
+    modulunun bir uyesiyse (Any, Optional, Dict, List, Union, Callable, vb.),
+    LLM'e tekrar sormadan DOGRUDAN, deterministik bir metin islemiyle duzeltir:
+    ilgili dosyadaki 'from typing import ...' satirina eksik adi ekler (yoksa
+    yeni bir import satiri ekler).
+
+    GERCEK MOTIVASYON: 2026-09-23'te canli bir dev_agent calismasinda
+    (PersonalExpenseTracker projesi) tam olarak bu hata (eksik 'Any' importu,
+    gui/expense_chart.py) modelin MAX_FIX_ATTEMPTS(5) denemesinin 4'unde de
+    (dosya her seferinde bastan yazildigi icin) giderilemedi - LLM'in dosyayi
+    yeniden uretmesi, bu turden tek satirlik/mekanik eksiklikleri guvenilir
+    sekilde yakalayamiyor. Bu fonksiyon _fix_files (LLM tabanli, olasiliksal
+    yeniden yazma) cagrilmadan ONCE denenir; basarili olursa bir model
+    cagrisina bile gerek kalmaz."""
+    match = re.search(r"NameError: name ['\"](\w+)['\"] is not defined", error_output)
+    if not match:
+        return False
+    missing_name = match.group(1)
+    if missing_name not in _TYPING_PUBLIC_NAMES:
+        return False
+
+    error_file, _ = _parse_traceback(error_output, project_files)
+    if not error_file:
+        return False
+    full_path = _safe_project_path(project_dir, error_file)
+    if full_path is None or not full_path.is_file():
+        return False
+
+    file_text = full_path.read_text(encoding="utf-8")
+    import_pattern = re.compile(r"^from typing import (.+)$", re.MULTILINE)
+    existing_match = import_pattern.search(file_text)
+    if existing_match:
+        existing_names = [n.strip() for n in existing_match.group(1).split(",")]
+        if missing_name in existing_names:
+            return False  # zaten import edilmis - baska bir sey bozuk, burada cozulemez
+        new_line = f"from typing import {', '.join(sorted(existing_names + [missing_name]))}"
+        file_text = file_text[:existing_match.start()] + new_line + file_text[existing_match.end():]
+    else:
+        file_text = f"from typing import {missing_name}\n" + file_text
+
+    full_path.write_text(file_text, encoding="utf-8")
+    print(f"[DevAgent] 🔧 Eksik 'typing.{missing_name}' importu otomatik eklendi ({error_file}).")
+    return True
+
+
 # Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
 # paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
 # yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
@@ -918,6 +968,13 @@ def _build_project(
             if installed:
                 auto_installs += 1
                 log("Missing dependency installed, retrying...")
+                time.sleep(1)
+                continue
+
+        if error_type == "runtime_error":
+            fixed_typing = _try_fix_typing_import(last_output, project_dir, list(file_codes.keys()))
+            if fixed_typing:
+                log("Eksik 'typing' importu otomatik eklendi (model cagrilmadan), tekrar deneniyor...")
                 time.sleep(1)
                 continue
 
