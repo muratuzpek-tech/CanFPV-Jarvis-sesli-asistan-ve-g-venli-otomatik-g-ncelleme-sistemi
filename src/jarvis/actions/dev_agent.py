@@ -1036,30 +1036,83 @@ def _try_fix_tkinter_submodule_import(error_output: str, project_dir: Path, proj
     return True
 
 
+def _apply_bad_symbol_fix(
+    missing_name: str,
+    module_dotted: str,
+    target_path: str,
+    public_top_level: list[str],
+    importer_path: str,
+    project_dir: Path,
+) -> bool:
+    """'_try_fix_bad_symbol_import' ve (Patch 11) proje HENUZ
+    CALISTIRILMADAN calisan proaktif statik denetleyicinin PAYLASTIGI asil
+    duzeltme mantigi. Ikisi de ayni guvenli iki-durumlu stratejiyi
+    kullanir - burada TEK bir yerde tutuluyor ki iki cagiran arasinda
+    davranis asla birbirinden sapmasin.
+
+    Strateji (guvenli, iki durum):
+    1) Eksik isim, ice aktaran dosyada IMPORT SATIRI DISINDA hic
+       kullanilmiyorsa: dogrudan, sadece o ismi import satirindan siler.
+    2) Eksik isim baska yerde de kullaniliyorsa VE hedef modulde tam
+       olarak TEK bir public (alt cizgiyle baslamayan) isim tanimliysa:
+       eksik ismin ice aktaran dosyadaki TUM (tam kelime) gecislerini o
+       tek gercek isimle degistirir.
+    Iki durumdan hicbiri kesin degilse hicbir sey yapmaz (False doner) -
+    boylece bu fonksiyon asla riskli bir tahminde bulunmaz."""
+    importer_full = _safe_project_path(project_dir, importer_path)
+    if importer_full is None or not importer_full.is_file():
+        return False
+
+    file_text = importer_full.read_text(encoding="utf-8")
+    name_pattern = re.compile(rf"\b{re.escape(missing_name)}\b")
+    occurrences = len(name_pattern.findall(file_text))
+
+    import_line_pattern = re.compile(
+        rf"^from {re.escape(module_dotted)} import (.+)$", re.MULTILINE
+    )
+    import_match = import_line_pattern.search(file_text)
+    if not import_match:
+        return False
+
+    if occurrences <= 1:
+        # Sadece import satirinda geciyor, hic kullanilmiyor - guvenle sil.
+        names = [n.strip() for n in import_match.group(1).split(",")]
+        remaining = [n for n in names if n != missing_name]
+        if remaining:
+            new_line = f"from {module_dotted} import {', '.join(remaining)}"
+            file_text = file_text[:import_match.start()] + new_line + file_text[import_match.end():]
+        else:
+            file_text = file_text[:import_match.start()] + file_text[import_match.end():].lstrip("\n")
+        importer_full.write_text(file_text, encoding="utf-8")
+        print(f"[DevAgent] 🔧 Kullanilmayan/kirik import '{missing_name}' kaldirildi ({importer_path}).")
+        return True
+
+    if len(public_top_level) == 1:
+        real_name = public_top_level[0]
+        file_text = name_pattern.sub(real_name, file_text)
+        importer_full.write_text(file_text, encoding="utf-8")
+        print(
+            f"[DevAgent] 🔧 Yanlis isim '{missing_name}' -> gercek isim "
+            f"'{real_name}' ile degistirildi ({importer_path}, {target_path}'de tanimli tek public isim)."
+        )
+        return True
+
+    return False  # belirsiz (0 ya da 2+ aday) - LLM tabanli genel duzeltmeye birak
+
+
 def _try_fix_bad_symbol_import(error_output: str, project_dir: Path, project_files: list[str]) -> bool:
     """'ImportError: cannot import name 'X' from 'Y'' hatasini, LLM'e
-    sormadan, deterministik bir AST analiziyle duzeltmeyi dener.
+    sormadan, deterministik bir AST analiziyle duzeltmeyi dener - bir
+    calisma denemesi BASARISIZ OLDUKTAN SONRA (traceback metninden)
+    tetiklenir. Asil duzeltme mantigi icin bkz. _apply_bad_symbol_fix
+    (Patch 11'de, proje hic calistirilmadan once calisan proaktif
+    denetleyiciyle paylasilmak uzere oraya tasindi).
 
     GERCEK MOTIVASYON: 2026-09-23'te canli bir dev_agent calismasinda
     (book_reader projesi) main.py, gui.py'nin GERCEK sinifi 'BookApp' iken
     'from gui import Application' yazmisti - var olmayan bir isim. Bu hata
     5 deneme boyunca duzelemedi, cunku _classify_error onu yanlislikla
-    "dependency_error" (eksik paket) sanip LLM'e o baglamda sunuyordu.
-
-    Strateji (guvenli, iki durum):
-    1) Eksik isim, ice aktaran dosyada IMPORT SATIRI DISINDA hic
-       kullanilmiyorsa: dogrudan, sadece o ismi import satirindan siler
-       (kullanilmayan/kirik bir import'u kaldirmak hicbir zaman yanlis
-       olmaz).
-    2) Eksik isim baska yerde de kullaniliyorsa VE hedef modulde tam
-       olarak TEK bir public (alt cizgiyle baslamayan) sinif/fonksiyon
-       tanimliysa: eksik ismin ice aktaran dosyadaki TUM (tam kelime)
-       gecislerini o tek gercek isimle degistirir.
-    Iki durumdan hicbiri kesin degilse (belirsizse) hicbir sey yapmaz,
-    dosya LLM tabanli genel duzeltmeye (_fix_files) birakilir - boylece
-    bu fonksiyon asla riskli bir tahminde bulunmaz."""
-    import ast
-
+    "dependency_error" (eksik paket) sanip LLM'e o baglamda sunuyordu."""
     match = re.search(
         r"cannot import name ['\"](\w+)['\"] from ['\"]([\w\.]+)['\"]",
         error_output,
@@ -1095,45 +1148,78 @@ def _try_fix_bad_symbol_import(error_output: str, project_dir: Path, project_fil
     error_file, _ = _parse_traceback(error_output, project_files)
     if not error_file:
         return False
-    error_full = _safe_project_path(project_dir, error_file)
-    if error_full is None or not error_full.is_file():
-        return False
 
-    file_text = error_full.read_text(encoding="utf-8")
-    name_pattern = re.compile(rf"\b{re.escape(missing_name)}\b")
-    occurrences = len(name_pattern.findall(file_text))
-
-    import_line_pattern = re.compile(
-        rf"^from {re.escape(module_dotted)} import (.+)$", re.MULTILINE
+    return _apply_bad_symbol_fix(
+        missing_name=missing_name,
+        module_dotted=module_dotted,
+        target_path=target_path,
+        public_top_level=public_top_level,
+        importer_path=error_file,
+        project_dir=project_dir,
     )
-    import_match = import_line_pattern.search(file_text)
-    if not import_match:
-        return False
 
-    if occurrences <= 1:
-        # Sadece import satirinda geciyor, hic kullanilmiyor - guvenle sil.
-        names = [n.strip() for n in import_match.group(1).split(",")]
-        remaining = [n for n in names if n != missing_name]
-        if remaining:
-            new_line = f"from {module_dotted} import {', '.join(remaining)}"
-            file_text = file_text[:import_match.start()] + new_line + file_text[import_match.end():]
-        else:
-            file_text = file_text[:import_match.start()] + file_text[import_match.end():].lstrip("\n")
-        error_full.write_text(file_text, encoding="utf-8")
-        print(f"[DevAgent] 🔧 Kullanilmayan/kirik import '{missing_name}' kaldirildi ({error_file}).")
-        return True
 
-    if len(public_top_level) == 1:
-        real_name = public_top_level[0]
-        file_text = name_pattern.sub(real_name, file_text)
-        error_full.write_text(file_text, encoding="utf-8")
-        print(
-            f"[DevAgent] 🔧 Yanlis isim '{missing_name}' -> gercek isim "
-            f"'{real_name}' ile degistirildi ({error_file}, {target_path}'de tanimli tek public isim)."
-        )
-        return True
+def _proactively_fix_cross_file_imports(project_dir: Path, file_codes: dict[str, str]) -> list[str]:
+    """Proje HENUZ TEK BIR KEZ BILE CALISTIRILMADAN, TUM dosyalarin
+    birbirinden yaptigi 'from X import Y' importlarini AST ile statik
+    olarak dogrular ve bulunan HER uyusmazligi (_apply_bad_symbol_fix'in
+    ayni guvenli iki-durumlu stratejisiyle) calistirma denemesi
+    harcamadan, ucretsiz ve aninda duzeltir. Duzeltilen dosyalarin
+    yollarini dondurur (bos liste = ya sorun yoktu ya da bulunanlar
+    belirsizdi/duzeltilemedi - ikisi de LLM tabanli _fix_files'a birakilir).
 
-    return False  # belirsiz (0 ya da 2+ aday) - LLM tabanli genel duzeltmeye birak
+    GERCEK MOTIVASYON: 2026-09-23'teki web_scraper_pro canli testinde
+    main.py 'core.scrapers'i DOGRU import ediyordu, ama core/scrapers.py -
+    _write_file'in dependency_context'i sayesinde utils/helpers.py'nin
+    GERCEK icerigini prompt'ta GOREBILMESINE RAGMEN - orada hic
+    tanimlanmayan bir 'log_message' fonksiyonunu import etmisti. Bu,
+    proje HIC CALISTIRILMADAN, saf statik analizle aninda yakalanabilecek
+    bir hataydi; ama eski akiste boyle bir hata sadece PAHALI bir calistir-
+    basarisiz-ol-duzelt dongusuyle (gercek Python surecini baslatma +
+    LLM'e sorma) fark ediliyordu. Daha kotusu: bu proje ardisik olarak
+    BIRDEN FAZLA farkli import uyusmazligi iceriyordu (once core.scrapers,
+    o duzelince ortaya cikan log_message) - MAX_FIX_ATTEMPTS (5) boyle
+    ardisik/farkli hatalar arasinda hizla tukeniyordu. Bu fonksiyon, ilk
+    calistirmadan ONCE TUM dosyalari birbirine karsi kontrol ederek,
+    birden fazla uyusmazligi TEK GECISTE, sifir maliyetle yakalar."""
+    fixed_paths: list[str] = []
+    project_files = list(file_codes.keys())
+    definitions = {fp: set(_extract_top_level_names(code)) for fp, code in file_codes.items()}
+
+    for fp, code in list(file_codes.items()):
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            target_path = _resolve_dotted_module_to_path(node.module, project_files)
+            if not target_path or target_path == fp:
+                continue
+            target_defined = definitions.get(target_path, set())
+            target_public = [n for n in target_defined if not n.startswith("_")]
+            for alias in node.names:
+                name = alias.name
+                if name == "*" or name.startswith("_") or name in target_defined:
+                    continue
+                fixed = _apply_bad_symbol_fix(
+                    missing_name=name,
+                    module_dotted=node.module,
+                    target_path=target_path,
+                    public_top_level=target_public,
+                    importer_path=fp,
+                    project_dir=project_dir,
+                )
+                if fixed:
+                    new_full = _safe_project_path(project_dir, fp)
+                    if new_full is not None and new_full.is_file():
+                        new_text = new_full.read_text(encoding="utf-8")
+                        file_codes[fp] = new_text
+                        code = new_text  # bu dosyanin kalan importlari icin de guncel metni kullan
+                        if fp not in fixed_paths:
+                            fixed_paths.append(fp)
+    return fixed_paths
 
 
 # Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
@@ -1584,6 +1670,17 @@ def _build_project(
         msg = "I could not write any project files, sir."
         if speak: speak(msg)
         return msg
+
+    # DUZELTME (2026-09-23, web_scraper_pro canli testi - bkz.
+    # _proactively_fix_cross_file_imports docstring'i): proje ILK KEZ
+    # calistirilmadan ONCE, tum dosyalarin birbirinden yaptigi importlari
+    # ucretsiz bir statik analiz gecisiyle dogrula/duzelt - boylece birden
+    # fazla ardisik import-isim uyusmazligi, pahali calistir-basarisiz-ol
+    # dongusunu (ve MAX_FIX_ATTEMPTS butcesini) tuketmeden, tek seferde
+    # yakalanip cozulsun.
+    proactively_fixed = _proactively_fix_cross_file_imports(project_dir, file_codes)
+    if proactively_fixed:
+        log(f"İlk çalıştırmadan önce {len(proactively_fixed)} dosyadaki import isim uyuşmazlığı proaktif olarak düzeltildi: {proactively_fixed}")
 
     if dependencies:
         install_result = _install_dependencies(dependencies, project_dir)
