@@ -143,6 +143,14 @@ def _classify_error(output: str, project_dir: Path | None = None) -> str:
 
     low = output.lower()
 
+    if "cannot import name" in low:
+        # Paket EKSIK degil - modul var ama beklenen isim (sinif/fonksiyon)
+        # onun icinde tanimli degil. pip install bunu asla cozemez, bu yuzden
+        # "no module named" kontrolunden ONCE, ayri bir tur olarak yakalanmali.
+        # (Asagidaki kontrol "importerror" gecen HER SEYI yakaladigi icin, bu
+        # satir olmadan bu dal asla calismazdi.)
+        return "import_error"
+
     if any(x in low for x in ("no module named", "modulenotfounderror", "importerror")):
         # "No module named X" HER ZAMAN eksik harici paket anlamina gelmez -
         # projenin KENDI dosyalarindan biri de olabilir (ornegin utils/helpers.py
@@ -215,7 +223,13 @@ Return ONLY valid JSON — no markdown, no explanation:
     }}
   ],
   "run_command": "python main.py",
-  "dependencies": ["requests"]
+  "dependencies": ["requests"],
+  "shared_data_contracts": [
+    "Describe here any data structure passed BETWEEN files that don't necessarily import each other directly (e.g. a dict/object built in one file and consumed in another via a function argument, not an import). Example: 'An expense is a dict with keys: amount (float), category (str), date (str, YYYY-MM-DD) - used identically by the GUI, the database layer, and any chart/report code.'"
+  ],
+  "expected_outputs": [
+    {{"path": "database.db", "description": "What a CORRECT result looks like inside this file after the app has genuinely worked (e.g. 'contains one row per scraped URL, with a non-empty title and paragraph')."}}
+  ]
 }}
 
 Critical rules:
@@ -225,6 +239,8 @@ Critical rules:
 4. Entry point must be in the files list.
 5. Use relative paths only (e.g. "utils/helpers.py", not absolute paths).
 6. Standard library modules (os, sys, json, etc.) do NOT go in "dependencies".
+7. CRITICAL for correctness: if two or more files exchange a data structure (a dict, a class instance, a tuple shape) — even files that never import each other, because the data actually flows through a third file like main.py — describe its EXACT shape ONCE in "shared_data_contracts" (field names, types, whether it's a dict or a specific class). Every file that touches this data MUST use the identical shape. This is the most common source of real bugs: e.g. one file builds {{"amount": ..., "category": ...}} while another expects an object with .amount/.category attributes.
+8. If running the entry point is supposed to durably create or update a file (a database, a report, an exported document, a log, a generated image, etc.), list each such file's relative path in "expected_outputs" with a one-line description of what a CORRECT result looks like inside it. Leave this list EMPTY only for purely interactive/display-only programs that persist nothing (e.g. a calculator, a GUI that only shows numbers on screen). This is critical: a program can run to completion with NO Python error while silently producing nothing real (a network call that fails silently, a thread that never runs, wrong file path) — "expected_outputs" is what lets that be caught instead of wrongly reported as a success.
 
 JSON:"""
 
@@ -258,6 +274,73 @@ def _safe_project_path(project_dir: Path, file_path: str) -> "Path | None":
         return None
 
 
+def _check_expected_outputs(project_dir: Path, expected_outputs: list, run_started_at: float) -> list[str]:
+    """Plan'da bildirilen "expected_outputs" dosyalarinin, projenin bu
+    calistirilmasi SIRASINDA gercekten olusup/guncellenip guncellenmedigini
+    kontrol eder. Bos liste = sorun yok.
+
+    GERCEK MOTIVASYON: 2026-09-23'te canli bir dev_agent testinde
+    (web_scraper projesi) program HICBIR Python hatasi vermeden calisip
+    "Scraping completed" yazdi, ama gercekte veritabanina TEK BIR satir bile
+    yazilmamisti - once bir thread-kilitlenmesi (ThreadPoolExecutor'i "with"
+    ile kullanmak mainloop()'un hic baslamamasina yol aciyordu), sonra da
+    Wikipedia'nin varsayilan User-Agent'i 403 ile reddetmesi yuzunden. Ikisi
+    de klasik bir Python traceback'i URETMEDI, bu yuzden _has_error()/
+    _classify_error() bu hatalarin IKISINI de goremezdi - dev_agent, hicbir
+    sey uretmemis bir programi "calisiyor, efendim" diye rapor ediyordu.
+    Bu fonksiyon, "cokmedi" ile "gercekten dogru calisti"nin AYNI SEY
+    OLMADIGINI" dogrulayan somut bir kontrol saglar."""
+    problems: list[str] = []
+    for item in expected_outputs or []:
+        rel_path = item.get("path") if isinstance(item, dict) else str(item)
+        if not rel_path:
+            continue
+        full_path = _safe_project_path(project_dir, rel_path)
+        if full_path is None:
+            continue
+        if not full_path.is_file():
+            problems.append(f"'{rel_path}' was never created.")
+            continue
+        try:
+            stat = full_path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime < run_started_at - 2:
+            problems.append(f"'{rel_path}' exists but was NOT updated during this run (stale - from before, or never actually touched now).")
+        elif stat.st_size == 0:
+            problems.append(f"'{rel_path}' was created/updated during this run but is completely empty (0 bytes).")
+    return problems
+
+
+def _format_output_problem_message(run_output: str, problems: list[str]) -> str:
+    """"Sessiz basarisizlik" (program cokmedi ama soz verilen ciktiyi
+    uretmedi) durumunu, _fix_files'a (LLM tabanli genel duzeltmeye) gercekten
+    yardimci olacak somut bir teshis mesajina cevirir. Asagidaki olasi
+    nedenler, 2026-09-23'teki canli hata avinda GERCEKTEN karsilasilan
+    sinifllardir - varsayimsal degildir."""
+    problems_text = "\n".join(f"  - {p}" for p in problems)
+    output_excerpt = run_output[:800].strip() if run_output and run_output.strip() else "(no output at all)"
+    return (
+        "NO PYTHON ERROR OCCURRED, but the program did not produce the output "
+        "it was supposed to produce:\n"
+        f"{problems_text}\n\n"
+        "This is a SILENT/LOGIC bug, not a crash - look for causes like: a "
+        "blocking call (e.g. using ThreadPoolExecutor as a context manager, "
+        "which waits for the task to finish before a GUI's mainloop() can "
+        "even start) that prevents real work from ever happening; a network "
+        "request that fails silently because of a missing/wrong header (many "
+        "real sites, including Wikipedia, reject a plain requests.get() with "
+        "no User-Agent) with the exception swallowed and never surfaced; "
+        "wrong assumptions about an external page/API's structure; writing "
+        "to the wrong working directory or file path; or a retry loop that "
+        "looks like it retries but never actually re-attempts the failed "
+        "operation. Fix the actual logic, not just the error message.\n\n"
+        "Actual console output from the run (may look harmless even though "
+        "nothing was produced):\n"
+        f"{output_excerpt}"
+    )
+
+
 def _write_file(
     file_info: dict,
     project_description: str,
@@ -265,6 +348,7 @@ def _write_file(
     language: str,
     project_dir: Path,
     already_written: dict[str, str],
+    shared_contracts: str = "",
 ) -> str:
     model = _get_model(MODEL_WRITER)
 
@@ -301,6 +385,12 @@ JS/TS-specific rules:
 - Add JSDoc comments for all exported functions.
 - Handle promise rejections with try/catch in async functions."""
 
+    shared_contracts_block = (
+        "Shared data contracts ALL files must follow EXACTLY, even files that do not "
+        "import each other (data often flows through a third file like main.py):\n"
+        + shared_contracts
+    ) if shared_contracts else ""
+
     prompt = f"""You are a senior {language} developer writing production-quality code for a real project.
 
 Project goal: {project_description}
@@ -309,6 +399,8 @@ Complete project file structure (in dependency order):
 {file_list}
 
 {f"Dependencies this file must import from other project files:{dependency_context}" if dependency_context else ""}
+
+{shared_contracts_block}
 
 Your task: Write the complete, working code for: {file_path}
 Purpose of this file: {file_desc}
@@ -632,6 +724,106 @@ def _try_fix_typing_import(error_output: str, project_dir: Path, project_files: 
     return True
 
 
+def _try_fix_bad_symbol_import(error_output: str, project_dir: Path, project_files: list[str]) -> bool:
+    """'ImportError: cannot import name 'X' from 'Y'' hatasini, LLM'e
+    sormadan, deterministik bir AST analiziyle duzeltmeyi dener.
+
+    GERCEK MOTIVASYON: 2026-09-23'te canli bir dev_agent calismasinda
+    (book_reader projesi) main.py, gui.py'nin GERCEK sinifi 'BookApp' iken
+    'from gui import Application' yazmisti - var olmayan bir isim. Bu hata
+    5 deneme boyunca duzelemedi, cunku _classify_error onu yanlislikla
+    "dependency_error" (eksik paket) sanip LLM'e o baglamda sunuyordu.
+
+    Strateji (guvenli, iki durum):
+    1) Eksik isim, ice aktaran dosyada IMPORT SATIRI DISINDA hic
+       kullanilmiyorsa: dogrudan, sadece o ismi import satirindan siler
+       (kullanilmayan/kirik bir import'u kaldirmak hicbir zaman yanlis
+       olmaz).
+    2) Eksik isim baska yerde de kullaniliyorsa VE hedef modulde tam
+       olarak TEK bir public (alt cizgiyle baslamayan) sinif/fonksiyon
+       tanimliysa: eksik ismin ice aktaran dosyadaki TUM (tam kelime)
+       gecislerini o tek gercek isimle degistirir.
+    Iki durumdan hicbiri kesin degilse (belirsizse) hicbir sey yapmaz,
+    dosya LLM tabanli genel duzeltmeye (_fix_files) birakilir - boylece
+    bu fonksiyon asla riskli bir tahminde bulunmaz."""
+    import ast
+
+    match = re.search(
+        r"cannot import name ['\"](\w+)['\"] from ['\"]([\w\.]+)['\"]",
+        error_output,
+    )
+    if not match:
+        return False
+    missing_name, module_dotted = match.group(1), match.group(2)
+
+    module_rel = module_dotted.replace(".", "/") + ".py"
+    target_path = None
+    for pf in project_files:
+        if pf == module_rel or pf.endswith("/" + module_rel) or Path(pf).stem == Path(module_rel).stem:
+            target_path = pf
+            break
+    if target_path is None:
+        return False
+    target_full = _safe_project_path(project_dir, target_path)
+    if target_full is None or not target_full.is_file():
+        return False
+
+    try:
+        tree = ast.parse(target_full.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return False
+    public_top_level = [
+        node.name for node in ast.iter_child_nodes(tree)
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+    ]
+    if missing_name in public_top_level:
+        return False  # aslinda orada tanimli - baska bir sey bozuk, burada cozulemez
+
+    error_file, _ = _parse_traceback(error_output, project_files)
+    if not error_file:
+        return False
+    error_full = _safe_project_path(project_dir, error_file)
+    if error_full is None or not error_full.is_file():
+        return False
+
+    file_text = error_full.read_text(encoding="utf-8")
+    name_pattern = re.compile(rf"\b{re.escape(missing_name)}\b")
+    occurrences = len(name_pattern.findall(file_text))
+
+    import_line_pattern = re.compile(
+        rf"^from {re.escape(module_dotted)} import (.+)$", re.MULTILINE
+    )
+    import_match = import_line_pattern.search(file_text)
+    if not import_match:
+        return False
+
+    if occurrences <= 1:
+        # Sadece import satirinda geciyor, hic kullanilmiyor - guvenle sil.
+        names = [n.strip() for n in import_match.group(1).split(",")]
+        remaining = [n for n in names if n != missing_name]
+        if remaining:
+            new_line = f"from {module_dotted} import {', '.join(remaining)}"
+            file_text = file_text[:import_match.start()] + new_line + file_text[import_match.end():]
+        else:
+            file_text = file_text[:import_match.start()] + file_text[import_match.end():].lstrip("\n")
+        error_full.write_text(file_text, encoding="utf-8")
+        print(f"[DevAgent] 🔧 Kullanilmayan/kirik import '{missing_name}' kaldirildi ({error_file}).")
+        return True
+
+    if len(public_top_level) == 1:
+        real_name = public_top_level[0]
+        file_text = name_pattern.sub(real_name, file_text)
+        error_full.write_text(file_text, encoding="utf-8")
+        print(
+            f"[DevAgent] 🔧 Yanlis isim '{missing_name}' -> gercek isim "
+            f"'{real_name}' ile degistirildi ({error_file}, {target_path}'de tanimli tek public isim)."
+        )
+        return True
+
+    return False  # belirsiz (0 ya da 2+ aday) - LLM tabanli genel duzeltmeye birak
+
+
 # Bazi paketlerin IMPORT adi (kod icinde "import X") ile PyPI'daki GERCEK
 # paket adi FARKLI - bunu bilmeden "No module named X" -> "pip install X"
 # yapmak calisir gibi gorunur ama bazilari icin asla basarili olmaz:
@@ -718,6 +910,7 @@ def _fix_files(
     language: str,
     project_dir: Path,
     entry_point: str,
+    shared_contracts: str = "",
 ) -> dict[str, str]:
 
     model = _get_model(MODEL_PLANNER)
@@ -754,6 +947,10 @@ def _fix_files(
             error_line and fix_path == error_file
         ) else ""
 
+        shared_contracts_block = (
+            "Shared data contracts ALL files must follow EXACTLY:\n" + shared_contracts
+        ) if shared_contracts else ""
+
         prompt = f"""You are an expert {language} debugger. Fix the broken file below.
 
 Project goal: {project_description}
@@ -763,6 +960,8 @@ All project files:
 
 Other files for context (read-only — fix only the target file):
 {other_ctx[:3500]}
+
+{shared_contracts_block}
 
 File to fix: {fix_path}{line_hint}
 Error type: {error_type}
@@ -846,6 +1045,8 @@ def _build_project(
     entry_point  = plan.get("entry_point", "main.py")
     run_command  = plan.get("run_command", f"python {entry_point}")
     dependencies = plan.get("dependencies", [])
+    shared_contracts_text = "\n".join(f"- {c}" for c in plan.get("shared_data_contracts", []) if c)
+    expected_outputs = plan.get("expected_outputs", [])
 
     log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
 
@@ -871,6 +1072,7 @@ def _build_project(
                     language=language,
                     project_dir=project_dir,
                     already_written=file_codes,
+                    shared_contracts=shared_contracts_text,
                 )
                 file_codes[file_path] = code
                 time.sleep(0.4)
@@ -903,6 +1105,7 @@ def _build_project(
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
+        run_started_at = time.time()
         last_output = _run_project(run_command, project_dir, current_timeout)
         log(f"Output preview: {last_output[:150]}")
 
@@ -918,43 +1121,69 @@ def _build_project(
             if speak: speak(msg)
             return f"{msg}\n\n{last_output}"
 
-        if not _has_error(last_output, run_command):
-            if last_output.startswith("Timed out"):
-                # _has_error() timeout'u kasitli olarak hata SAYMIYOR (bir sunucu/
-                # GUI kasitli olarak surekli calisabilir), AMA bu hicbir sey
-                # DOGRULANMADI demektir - antivirus/soguk-import gecikmesi ya da
-                # gercekten takili kalmis bozuk bir betik de ayni ciktiyi verir
-                # (2026-09-21'de canli testte gozlemlendi: Norton 360 taramasi
-                # yuzunden ilk import 30sn'yi asti). Once, henuz kullanilmadiysa,
-                # BIR KEZ uzatilmis timeout ile tekrar denenir - fresh bir pip
-                # install sonrasi soguk import gecikmesini karsilamak icin.
-                if not timeout_extended and attempt < MAX_FIX_ATTEMPTS:
-                    timeout_extended = True
-                    current_timeout = timeout * 3
-                    log(f"Zaman asimi - {current_timeout}s ile bir kez daha deneniyor (soguk import/antivirus taramasi olabilir)...")
-                    time.sleep(1)
-                    continue
+        is_timeout = last_output.startswith("Timed out")
+
+        if is_timeout and not timeout_extended and attempt < MAX_FIX_ATTEMPTS:
+            # _has_error() timeout'u kasitli olarak hata SAYMIYOR (bir sunucu/
+            # GUI kasitli olarak surekli calisabilir), AMA bu hicbir sey
+            # DOGRULANMADI demektir - antivirus/soguk-import gecikmesi ya da
+            # gercekten takili kalmis bozuk bir betik de ayni ciktiyi verir
+            # (2026-09-21'de canli testte gozlemlendi: Norton 360 taramasi
+            # yuzunden ilk import 30sn'yi asti). Once, henuz kullanilmadiysa,
+            # BIR KEZ uzatilmis timeout ile tekrar denenir - fresh bir pip
+            # install sonrasi soguk import gecikmesini karsilamak icin.
+            timeout_extended = True
+            current_timeout = timeout * 3
+            log(f"Zaman asimi - {current_timeout}s ile bir kez daha deneniyor (soguk import/antivirus taramasi olabilir)...")
+            time.sleep(1)
+            continue
+
+        has_crash_error = _has_error(last_output, run_command)
+
+        # DUZELTME (2026-09-23, web_scraper canli testi): "cokmedi" ile
+        # "gercekten dogru calisti" AYNI SEY DEGIL. O testte program hicbir
+        # Python hatasi vermeden calisip bitti ("Scraping completed" yazdi),
+        # ama gercekte hicbir satir veritabanina yazilmamisti. _has_error()
+        # SADECE Python traceback'lerini arar, boyle sessiz/mantik
+        # hatalarini asla goremez. Plan "expected_outputs" bildirdiyse, o
+        # dosyalarin bu calistirmada GERCEKTEN olusup/guncellenip
+        # guncellenmedigini kendimiz kontrol ediyoruz.
+        output_problems = (
+            _check_expected_outputs(project_dir, expected_outputs, run_started_at)
+            if expected_outputs and not has_crash_error else []
+        )
+        if output_problems:
+            log(f"Program çökmedi ama beklenen çıktı üretilmedi: {output_problems}")
+            last_output = _format_output_problem_message(last_output, output_problems)
+
+        if not has_crash_error and not output_problems:
+            if is_timeout:
+                if expected_outputs:
+                    verified_note = f" Beklenen çıktılar gerçekten doğrulandı ({', '.join(str(o.get('path', o)) if isinstance(o, dict) else str(o) for o in expected_outputs)})."
+                else:
+                    verified_note = " AMA betiğin gerçekten doğru çalıştığını DOĞRULAYAMADIM, takılı kalmış da olabilir."
                 msg = (
                     f"'{proj_name}' projesi {current_timeout} saniye içinde tamamlanmadı, efendim. "
-                    f"Bu, kasıtlı olarak sürekli çalışan bir sunucu/GUI uygulaması olabilir — AMA "
-                    f"betiğin gerçekten doğru çalıştığını DOĞRULAYAMADIM, takılı kalmış da olabilir. "
+                    f"Bu, kasıtlı olarak sürekli çalışan bir sunucu/GUI uygulaması olabilir.{verified_note} "
                     f"Dosyalar {project_dir} içinde duruyor, lütfen VSCode'dan elle kontrol edin."
                 )
-                if speak: speak(msg)
-                return f"{msg}\n\nOutput:\n{last_output}"
-
-            msg = (
-                f"Project '{proj_name}' is working, sir. "
-                f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to: {project_dir}"
-            )
+            else:
+                verified_note = (
+                    f" Verified outputs: {', '.join(str(o.get('path', o)) if isinstance(o, dict) else str(o) for o in expected_outputs)}."
+                    if expected_outputs else ""
+                )
+                msg = (
+                    f"Project '{proj_name}' is working, sir. "
+                    f"Built in {attempt} attempt{'s' if attempt > 1 else ''}.{verified_note} "
+                    f"Saved to: {project_dir}"
+                )
             if speak: speak(msg)
             return f"{msg}\n\nOutput:\n{last_output}"
 
         if attempt == MAX_FIX_ATTEMPTS:
             break
 
-        error_type = _classify_error(last_output, project_dir)
+        error_type = "output_missing" if output_problems else _classify_error(last_output, project_dir)
 
         if error_type == "local_import_error":
             fixed = _try_fix_local_import(last_output, project_dir)
@@ -978,6 +1207,13 @@ def _build_project(
                 time.sleep(1)
                 continue
 
+        if error_type == "import_error":
+            fixed_symbol = _try_fix_bad_symbol_import(last_output, project_dir, list(file_codes.keys()))
+            if fixed_symbol:
+                log("Yanlis/kirik isim importu otomatik duzeltildi (model cagrilmadan), tekrar deneniyor...")
+                time.sleep(1)
+                continue
+
         log(f"Fixing errors (type: {error_type})...")
         try:
             updated = _fix_files(
@@ -988,6 +1224,7 @@ def _build_project(
                 language=language,
                 project_dir=project_dir,
                 entry_point=entry_point,
+                shared_contracts=shared_contracts_text,
             )
             file_codes.update(updated)
             time.sleep(1)
