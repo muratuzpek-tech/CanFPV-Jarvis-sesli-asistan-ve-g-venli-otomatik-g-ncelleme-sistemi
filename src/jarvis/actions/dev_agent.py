@@ -1610,6 +1610,29 @@ def _call_func_name(call: ast.Call) -> str:
     return ""
 
 
+def _file_imports_tkinter(tree: ast.Module) -> bool:
+    """Dosyanin modul-seviyesinde tkinter'i import edip etmedigini kontrol
+    eder (Yama 18). GERCEK bir canli testte bulunan bosluk: Tkinter'da GUI
+    sinifi yazmanin IKI esit derecede yaygin deseni var - (1) KALITIM:
+    'class App(tk.Tk):' ve (2) BILESIM/composition: 'class App:' + '__init__
+    (self, root)' + root disaridan Tk() olarak verilir. Yama 15 SADECE (1)'i
+    taniyordu (base_names icinde 'Tk'/'Frame' arayarak) - bilesim deseni hic
+    incelenmiyordu, ve tam da bu yuzden 10. canli testte (Wikipedia_Scraper)
+    'class App:' (hicbir siniftan turemeyen, root'u parametre alan) sinifinin
+    butona-bagli-tek-tetikleyici hatasi HIC yakalanamadi. Dosya seviyesinde
+    tkinter import'u aramak, hangi OOP deseni kullanilirsa kullanilsin bu
+    dosyanin gercekten bir Tkinter GUI dosyasi oldugunu guvenli sekilde
+    tespit eder."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in ("tkinter", "Tkinter") for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in ("tkinter", "Tkinter"):
+                return True
+    return False
+
+
 def _detect_gui_manual_only_trigger(source: str) -> "list[dict] | None":
     """Tek bir dosyanin kaynagini tarar; yukarida aciklanan KATI kurala gore
     'sadece butona bagli, hicbir yerde otomatik cagrilmayan' bir GUI
@@ -1620,6 +1643,7 @@ def _detect_gui_manual_only_trigger(source: str) -> "list[dict] | None":
         return None
 
     findings: list[dict] = []
+    file_imports_tk = _file_imports_tkinter(tree)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
@@ -1631,7 +1655,11 @@ def _detect_gui_manual_only_trigger(source: str) -> "list[dict] | None":
                 base_names.append(base.attr)
             elif isinstance(base, ast.Name):
                 base_names.append(base.id)
-        looks_like_gui = any(("Tk" in b or "Frame" in b) for b in base_names)
+        # Yama 18: kalitim deseni (Tk/Frame'den tureme) YA DA dosya
+        # tkinter import ediyorsa (bilesim/composition deseni de dahil).
+        # Yanlis-pozitif riski dusuk kalir cunku asagidaki widget-cagrisi
+        # kontrolu (Button sonek / add_command) zaten cok dar kapsamli.
+        looks_like_gui = any(("Tk" in b or "Frame" in b) for b in base_names) or file_imports_tk
         if not looks_like_gui:
             continue
 
