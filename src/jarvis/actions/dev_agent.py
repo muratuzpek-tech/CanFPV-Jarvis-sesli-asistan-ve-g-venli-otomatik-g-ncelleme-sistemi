@@ -3,7 +3,9 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -266,13 +268,56 @@ JSON:"""
     try:
         response = model.generate_content(prompt)
         raw = _strip_fences(response.text)
-        return json.loads(raw)
+        plan = json.loads(raw)
+        return _validate_plan(plan, description)
     except json.JSONDecodeError as e:
         raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {response.text[:300]}") from e
     except Exception as e:
         if _is_rate_limit(e):
             raise RateLimitError(str(e)) from e
         raise
+
+
+def _validate_plan(plan: dict, description: str) -> dict:
+    """Reject incomplete plans before generated files are written."""
+    if not isinstance(plan, dict):
+        raise ValueError("Planner response must be a JSON object.")
+    files = plan.get("files")
+    entry = plan.get("entry_point")
+    if not isinstance(files, list) or not files:
+        raise ValueError("Planner returned no project files.")
+    paths = [f.get("path") for f in files if isinstance(f, dict)]
+    if any(not isinstance(p, str) or not p.strip() for p in paths):
+        raise ValueError("Every planned file must have a non-empty relative path.")
+    if not isinstance(entry, str) or entry not in paths:
+        raise ValueError("Planner entry_point must match a file in files.")
+    if Path(entry).is_absolute() or ".." in Path(entry).parts:
+        raise ValueError("Planner entry_point must stay inside the project.")
+    if len(paths) != len(set(paths)):
+        raise ValueError("Planner returned duplicate file paths.")
+
+    desc = description.lower()
+    persistence_words = (
+        "database", "sqlite", "save", "store", "write", "export", "report",
+        "log", "dosyaya", "veritaban", "kaydet",
+    )
+    if any(word in desc for word in persistence_words):
+        outputs = plan.get("expected_outputs")
+        if not isinstance(outputs, list) or not outputs:
+            raise ValueError(
+                "This request requires durable output, but planner returned no expected_outputs."
+            )
+    outputs = plan.get("expected_outputs", [])
+    if not isinstance(outputs, list):
+        raise ValueError("expected_outputs must be a list.")
+    for output in outputs:
+        path = output.get("path") if isinstance(output, dict) else output
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("Every expected output must have a relative path.")
+        if Path(path).is_absolute() or ".." in Path(path).parts:
+            raise ValueError(f"Expected output escapes project: {path}")
+    return plan
+
 
 def _sanitize_plan_against_self_reference(plan: dict) -> dict:
     """Model bazen urettigi projenin dosya YAPISINA bile kendi calisma
@@ -378,6 +423,47 @@ def _check_expected_outputs(project_dir: Path, expected_outputs: list, run_start
             problems.append(f"'{rel_path}' exists but was NOT updated during this run (stale - from before, or never actually touched now).")
         elif stat.st_size == 0:
             problems.append(f"'{rel_path}' was created/updated during this run but is completely empty (0 bytes).")
+    return problems
+
+
+def _check_output_contents(project_dir: Path, expected_outputs: list) -> list[str]:
+    """Validate durable outputs, not merely their timestamps."""
+    problems: list[str] = []
+    for item in expected_outputs or []:
+        rel_path = item.get("path") if isinstance(item, dict) else str(item)
+        description = str(item.get("description", "") if isinstance(item, dict) else "").lower()
+        full_path = _safe_project_path(project_dir, rel_path)
+        if full_path is None or not full_path.is_file():
+            continue
+        if full_path.stat().st_size == 0:
+            problems.append(f"'{rel_path}' is empty.")
+            continue
+        suffix = full_path.suffix.lower()
+        if suffix in {".json", ".jsonl"}:
+            try:
+                if suffix == ".json":
+                    json.loads(full_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                problems.append(f"'{rel_path}' is not valid JSON: {exc}")
+        if suffix in {".db", ".sqlite", ".sqlite3"}:
+            try:
+                with sqlite3.connect(str(full_path), timeout=5) as conn:
+                    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                    if integrity != "ok":
+                        problems.append(f"'{rel_path}' failed SQLite integrity_check: {integrity}")
+                    if any(word in description for word in ("row", "record", "kayıt", "scrap", "result")):
+                        tables = conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                        row_count = sum(
+                            conn.execute(f'SELECT COUNT(*) FROM "{name[0]}"').fetchone()[0]
+                            for name in tables
+                            if name[0] != "sqlite_sequence"
+                        )
+                        if row_count == 0:
+                            problems.append(f"'{rel_path}' is valid but contains no data rows.")
+            except (OSError, sqlite3.Error) as exc:
+                problems.append(f"'{rel_path}' could not be validated as SQLite: {exc}")
     return problems
 
 
@@ -903,7 +989,9 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
         )
 
     try:
-        parts = run_command.split()
+        parts = shlex.split(run_command, posix=(os.name != "nt"))
+        if not parts:
+            return "Run error: planner returned an empty run_command."
         if parts[0].lower() == "python":
             parts[0] = sys.executable
 
@@ -2596,6 +2684,14 @@ def _build_project(
     if dependencies:
         install_result = _install_dependencies(dependencies, project_dir)
         log(install_result)
+        if install_result.startswith(("Install warning", "Install error", "Dependency install timed out")):
+            msg = (
+                f"'{proj_name}' projesi için bağımlılıklar kurulamadı; çalışma doğrulaması yapılmadı. "
+                f"Dosyalar {project_dir} içinde duruyor."
+            )
+            if speak:
+                speak(msg)
+            return f"{msg}\n\n{install_result}"
 
     _open_vscode(project_dir)
 
@@ -2650,10 +2746,13 @@ def _build_project(
         # hatalarini asla goremez. Plan "expected_outputs" bildirdiyse, o
         # dosyalarin bu calistirmada GERCEKTEN olusup/guncellenip
         # guncellenmedigini kendimiz kontrol ediyoruz.
-        output_problems = (
-            _check_expected_outputs(project_dir, expected_outputs, run_started_at)
-            if expected_outputs and not has_crash_error else []
-        )
+        output_problems = []
+        if expected_outputs and not has_crash_error:
+            output_problems.extend(
+                _check_expected_outputs(project_dir, expected_outputs, run_started_at)
+            )
+            if not output_problems:
+                output_problems.extend(_check_output_contents(project_dir, expected_outputs))
         if output_problems:
             log(f"Program çökmedi ama beklenen çıktı üretilmedi: {output_problems}")
             filename_mismatches = _detect_output_filename_mismatch(
