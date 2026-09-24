@@ -2133,6 +2133,7 @@ def _fix_files(
     expected_outputs: str = "",
     known_error_type: str = "",
     lint_issues: "dict[str, list[dict]] | None" = None,
+    repeat_of_previous: bool = False,
 ) -> dict[str, str]:
 
     model = _get_model(MODEL_PLANNER)
@@ -2321,6 +2322,30 @@ def _fix_files(
                 f"describes, while keeping the button itself working too."
             )
 
+        repeat_note = ""
+        if repeat_of_previous:
+            # Gercek 14. testte gozlemlendi (NewsAggregatorLinux14, 2026-09-24):
+            # bir arguman-sayisi uyusmazligi (TypeError) 3 deneme boyunca
+            # BIREBIR AYNI hatayla cakildi - fixer her seferinde ayni (hala
+            # bozuk) prompt'u goruyor ve dusuk sicaklikli yerel bir model
+            # (Ollama/qwen2.5-coder) buyuk ihtimalle ayni (hala yanlis)
+            # kodu tekrar uretiyor. Onceki deneme BASARISIZ oldugunu ve
+            # AYNI SEYI TEKRARLAMAMASI gerektigini modele acikca soylemek,
+            # onu farkli/daha dikkatli bir cozume itmek icin.
+            repeat_note = (
+                "\n\n⚠️ REPEATED FAILURE WARNING: your PREVIOUS fix attempt for this "
+                "exact file did NOT resolve the problem — running the project again "
+                "produced the EXACT SAME error output as before, byte-for-byte. This "
+                "means your last change either didn't touch the real bug, or "
+                "reintroduced it. Do NOT repeat the same edit again. Look very "
+                "carefully and precisely at the traceback: check that every function "
+                "call's argument COUNT and ORDER exactly matches that function's real "
+                "signature in the file where it is defined (a common cause of this "
+                "exact situation is one file calling a method with a different "
+                "number of arguments than the method actually accepts), and check "
+                "for any other cross-file assumption that might be wrong."
+            )
+
         shared_contracts_block = (
             "Shared data contracts ALL files must follow EXACTLY:\n" + shared_contracts
         ) if shared_contracts else ""
@@ -2354,6 +2379,7 @@ Error output:
 {import_mismatch_note}
 {circular_import_note}
 {lint_issues_note}
+{repeat_note}
 {web_context}
 Current (broken) code:
 {current_code}
@@ -2577,6 +2603,7 @@ def _build_project(
     auto_installs    = 0
     timeout_extended = False
     current_timeout  = timeout
+    previous_fix_error_output: str | None = None
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
@@ -2702,6 +2729,11 @@ def _build_project(
                 time.sleep(1)
                 continue
 
+        repeat_of_previous = (
+            previous_fix_error_output is not None and last_output == previous_fix_error_output
+        )
+        if repeat_of_previous:
+            log("⚠️ Önceki düzeltme denemesiyle BİREBİR AYNI hata tekrar oluştu - model bu kez uyarılıyor.")
         log(f"Fixing errors (type: {error_type})...")
         try:
             updated = _fix_files(
@@ -2715,8 +2747,10 @@ def _build_project(
                 shared_contracts=shared_contracts_text,
                 expected_outputs=expected_outputs_text,
                 known_error_type=error_type,
+                repeat_of_previous=repeat_of_previous,
             )
             file_codes.update(updated)
+            previous_fix_error_output = last_output
             time.sleep(1)
         except RateLimitError:
             msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
