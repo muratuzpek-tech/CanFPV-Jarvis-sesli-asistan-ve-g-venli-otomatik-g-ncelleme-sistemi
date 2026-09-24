@@ -2322,6 +2322,16 @@ def _fix_files(
         for fp, code in file_codes.items():
             if fp != entry_point and any(hint in code for hint in _no_traceback_hints):
                 files_to_fix.append(fp)
+        # Bir fonksiyonun çağrıldığı dosya ile tanımlandığı dosya arasındaki
+        # sözleşme uyuşmazlığında traceback çoğu zaman yalnızca çağıranı
+        # gösterir. Örneğin worker.py, fetch_page() imzasına uymayan bir
+        # keyword gönderirse sadece main.py'yi düzeltmek aynı hatayı tekrarlar.
+        if any(token in error_output.lower() for token in (
+            "unexpected keyword", "unexpected key", "got an unexpected"
+        )):
+            for fp in file_codes:
+                if fp not in files_to_fix:
+                    files_to_fix.append(fp)
     else:
         files_to_fix.append(entry_point)
 
@@ -2558,6 +2568,20 @@ def _build_project(
         + (f": {o.get('description', '')}" if isinstance(o, dict) and o.get("description") else "")
         for o in expected_outputs if o
     )
+
+    # Aynı proje adıyla yapılan tekrar denemelerde eski database.db/report
+    # dosyası yeni çalışmanın sonucu gibi görünmemeli. Yalnızca planner'ın
+    # beklenen çıktı listesinde bulunan, proje içindeki dosyalar temizlenir;
+    # kaynak dosyalarına veya proje dışına dokunulmaz.
+    for output in expected_outputs:
+        output_path = output.get("path") if isinstance(output, dict) else str(output)
+        full_output = _safe_project_path(project_dir, output_path)
+        if full_output and full_output.is_file():
+            try:
+                full_output.unlink()
+                log(f"🧹 Eski beklenen çıktı temizlendi: {output_path}")
+            except OSError as exc:
+                log(f"⚠️ Eski çıktı temizlenemedi: {output_path} ({exc})")
 
     log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
 
