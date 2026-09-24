@@ -2689,6 +2689,27 @@ def _build_project(
     for _fp, _issues in gui_trigger_issues.items():
         lint_issues.setdefault(_fp, []).extend(_issues)
 
+    # GUI projeleri otomatik doğrulanabilir bir yol taşımak zorunda. Sadece
+    # butonlu bir Tkinter uygulaması dev-agent tarafından başlatıldığında
+    # pencere açık kalır, fakat scraping/database işi hiç başlamayabilir.
+    # Önceki detector sınıf/command kalıbını yakalayamadığında bu genel
+    # sözleşme kontrolü yine de writer/fixer'a açık talimat verir.
+    all_generated_source = "\n".join(file_codes.values())
+    gui_task = bool(re.search(r"\b(?:tkinter|tk\.)\b", description, re.IGNORECASE))
+    if gui_task and expected_outputs and "--headless-test" not in all_generated_source:
+        lint_issues.setdefault(entry_point, []).append({
+            "code": "GUI-HEADLESS-VERIFICATION-MISSING",
+            "message": (
+                "This GUI project has concrete expected outputs but no --headless-test "
+                "mode. Add argparse --headless-test that runs the complete workflow "
+                "without opening Tk/mainloop, prints processed/successful/failed/"
+                "database_records and prints SUCCESS only when all URLs succeed. "
+                "Keep the interactive GUI for normal use."
+            ),
+            "line": 0,
+            "col": 0,
+        })
+
     # DUZELTME (Yama 20): dongusel import tespiti - bkz. _detect_circular_imports
     # docstring'i. AYNI birlesik {dosya: [bulgu,...]} sekli, bu yuzden ruff ve
     # GUI-tetikleyici bulgularinin YANINA eklenip TEK bir _fix_files
@@ -2719,6 +2740,14 @@ def _build_project(
             file_codes.update(lint_fixed)
         except RateLimitError:
             log("Rate limit - ruff proaktif düzeltmesi atlandı, normal çalıştırma denemesine geçiliyor.")
+
+    # Model headless modu eklediyse GUI'yi değil, otomatik doğrulama yolunu
+    # çalıştır. Böylece root.mainloop() timeout üretmez ve database çıktısı
+    # gerçekten üretim sırasında doğrulanabilir.
+    entry_source = file_codes.get(entry_point, "")
+    if gui_task and "--headless-test" in entry_source and "--headless-test" not in run_command:
+        run_command = f"{run_command} --headless-test"
+        log(f"Headless doğrulama komutu seçildi: {run_command}")
 
     if dependencies:
         install_result = _install_dependencies(dependencies, project_dir)
