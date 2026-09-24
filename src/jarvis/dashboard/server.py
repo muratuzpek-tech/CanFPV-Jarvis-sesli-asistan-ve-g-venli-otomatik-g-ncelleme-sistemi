@@ -711,10 +711,16 @@ class DashboardServer:
 
         # ── File sharing ──────────────────────────────────────────────────────
 
-        def _safe_filename(raw: str) -> str:
-            name = Path(str(raw)).name
-            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
-            return name or "upload"
+        def _safe_filename(raw: str) -> str | None:
+            name = str(raw).strip()
+            # Only allow plain filenames (no path separators or traversal tokens).
+            if not name or name in {".", ".."}:
+                return None
+            if "/" in name or "\\" in name:
+                return None
+            if not re.fullmatch(r"[A-Za-z0-9._ -]{1,255}", name):
+                return None
+            return name
 
         def _upload_path(name: str) -> Path | None:
             """Resolve one regular file directly below the upload root."""
@@ -815,10 +821,12 @@ class DashboardServer:
             if not self._valid_token(tok):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             safe = _safe_filename(filename)
+            if safe is None:
+                return JSONResponse({"error": "Not found"}, status_code=404)
             root = self._uploads_dir.resolve()
             raw_path = root / safe
             path = raw_path.resolve()
-            if (safe != filename or raw_path.is_symlink() or path.parent != root
+            if (raw_path.is_symlink() or path.parent != root
                     or root not in path.parents or not path.is_file()):
                 return JSONResponse({"error": "Not found"}, status_code=404)
             return FileResponse(str(path), filename=safe)
