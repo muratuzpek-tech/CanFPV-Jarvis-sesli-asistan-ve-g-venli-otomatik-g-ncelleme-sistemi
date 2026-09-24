@@ -2899,11 +2899,14 @@ def dev_agent(
             f"project_name ile ve confirm_code='{code}' parametresiyle TEKRAR çağır. "
             f"Kullanıcı onaylamadan bu kodu kendi kendine kullanma."
         )
-    pending = _pending_dev_agent.pop(confirm_code, None)
+    # Kota/ağ/model hatasında aynı açık onayla tekrar denenebilsin. Eski akış
+    # build başlamadan kodu siliyor, Gemini 429 sonrasında kullanıcıyı yeni
+    # onay döngüsüne zorluyordu.
+    pending = _pending_dev_agent.get(confirm_code)
     if pending is None:
         return "Onay kodu geçersiz veya süresi dolmuş. Önce confirm_code vermeden çağırıp yeni kod alın."
 
-    return _build_project(
+    result = _build_project(
         description  = pending["description"],
         language     = pending["language"],
         project_name = pending["project_name"],
@@ -2911,3 +2914,6 @@ def dev_agent(
         speak        = speak,
         player       = player,
     )
+    if not result.startswith("Rate limit reached"):
+        _pending_dev_agent.pop(confirm_code, None)
+    return result
