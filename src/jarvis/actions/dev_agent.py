@@ -843,12 +843,27 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     # Ayni sys.stdlib_module_names kontrolunu burada da uygulayarak iki
     # kurulum yolunu da (reaktif + proaktif) tutarli hale getiriyoruz.
     stdlib_names = getattr(sys, "stdlib_module_names", frozenset())
+    # Import adı ile PyPI dağıtım adı her zaman aynı değildir. Yerel model
+    # sıkça BeautifulSoup yazar; kurulabilir gerçek dağıtım beautifulsoup4'tür.
+    package_aliases = {
+        "beautifulsoup": "beautifulsoup4",
+        "bs4": "beautifulsoup4",
+        "pillow": "Pillow",
+        "cv2": "opencv-python",
+        "yaml": "PyYAML",
+    }
     real_dependencies = []
     for dep in dependencies:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         if pkg_name.lower() in stdlib_names:
             print(f"[DevAgent] ⚠️ '{pkg_name}' zaten Python standart kütüphanesinin bir parçası (pip'te böyle bir paket yok) - planlayıcı bunu yanlışlıkla dependencies listesine eklemiş, kurulum denenmeyecek.")
             continue
+        alias = package_aliases.get(pkg_name.lower())
+        if alias:
+            version_suffix = dep[len(pkg_name):]
+            dep = alias + version_suffix
+            pkg_name = alias
+            print(f"[DevAgent] 🔧 Paket adı düzeltildi: {dep} (planner import adını kullanmıştı).")
         real_dependencies.append(dep)
 
     if not real_dependencies:
