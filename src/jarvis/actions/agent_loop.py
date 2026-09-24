@@ -582,7 +582,7 @@ def _tick() -> None:
 
 
 def _worker_loop(interval_seconds: float) -> None:
-    print(f"[AgentLoop] ✅ Başladı ({interval_seconds:.0f}sn'de bir kontrol).")
+    print(f"[AgentLoop] [OK] Başladı ({interval_seconds:.0f}sn'de bir kontrol).")
     while True:
         try:
             _tick()

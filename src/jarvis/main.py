@@ -101,16 +101,9 @@ def _is_github_self_improve_request(text: str) -> bool:
 
 
 def _is_generic_task_request(text: str) -> bool:
-    """Detect an explicit Turkish request to add a background task."""
     t = (text or "").casefold().strip()
-    if not t or any(term in t for term in ("görev durumu", "gorev durumu", "görev listesi", "gorev listesi")):
-        return False
-    has_task = any(term in t for term in ("görev", "gorev"))
-    has_add = any(term in t for term in (
-        "ver", "ekle", "başlat", "baslat", "gönder", "gonder", "oluştur", "olustur",
-        "görev kayd", "gorev kayd", "görev listem", "gorev listem", "görev olarak", "gorev olarak",
-    ))
-    return has_task and has_add
+    return any(e in t for e in ["görev kuyruğuna ekle", "görev listeme ekle", "arka planda çalıştır"])
+
 
 
 def get_base_dir():
@@ -126,7 +119,7 @@ LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+CHUNK_SIZE          = 2048 # AirPods Pro Koruma Ayari
 
 
 def _pcm_rms_level(data: bytes, max_expected: float = 9000.0) -> float:
