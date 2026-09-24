@@ -179,6 +179,23 @@ def _classify_error(output: str, project_dir: Path | None = None) -> str:
     )):
         return "runtime_error"
 
+    # Yukaridaki kontroller UYAKALANMAMIS bir traceback'in kalibini (SinifAdi:
+    # mesaj) arar. Ama kod kendi hatasini "except X as e: print(e)" ile
+    # yakalayip YALNIZCA mesaji yazdirirsa (sinif adi hic gorunmez), yukaridaki
+    # hicbir kalip eslesmez ve calisma yanlislikla "hatasiz" sayilir - proje
+    # gercekte hicbir satir yazmamis olsa bile (ornek: sqlite3'e ham bir Python
+    # list'i parametre olarak baglamaya calisan kod, "Error binding parameter
+    # 2: type 'list' is not supported" diye yazdirir ve sessizce yutar; sinif
+    # adi olan "sqlite3.Error"/"ProgrammingError" hic goze gorunmez). Bu genel
+    # bir yedek: "error"/"exception" kelimesi baska hicbir ozel kaliba
+    # uymadan, kendi basina (kelime siniri ile) gecerse yine de supheli sayilir.
+    # Bilinen odun: "0 error bulundu" gibi zararsiz bir cikti da tetikleyebilir
+    # - ama bu, zaten var olan kaba anahtar-kelime yaklasiminin ayni turden bir
+    # riski, yeni degil; sessizce yutulan gercek bir hatayi kacirmak (mevcut
+    # davranis) bundan daha pahaliya mal oluyor.
+    if re.search(r"\b(error|exception)\b", low):
+        return "runtime_error"
+
     return "none"
 
 
