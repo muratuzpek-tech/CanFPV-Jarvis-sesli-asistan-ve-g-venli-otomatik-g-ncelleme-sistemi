@@ -1937,6 +1937,135 @@ def _extract_top_level_names(source: str) -> list[str]:
     return names
 
 
+def _project_module_name(fp: str) -> str:
+    """'core/database.py' -> 'core.database'; 'main.py' -> 'main'."""
+    norm = fp.replace("\\", "/")
+    if norm.endswith(".py"):
+        norm = norm[:-3]
+    if norm.endswith("/__init__"):
+        norm = norm[: -len("/__init__")]
+    return norm.replace("/", ".")
+
+
+def _top_level_local_imports(tree: ast.Module, module_names: set[str]) -> set[str]:
+    """Bir dosyanin SADECE modul-seviyesindeki (fonksiyon/sinif govdesine
+    GOMULU OLMAYAN) import ifadelerini tarar ve projenin KENDI dosyalarina
+    (module_names) karsilik gelenleri dondurur. KASITLI OLARAK ast.walk
+    DEGIL, sadece tree.body (dogrudan modul govdesi) taraniyor - bir
+    fonksiyon/metod GOVDESI icine gizlenmis (gecikmeli/lazy) bir import,
+    dongusel importu KIRMAK icin YAYGIN ve GECERLI bir teknik oldugundan,
+    bunu yanlislikla "hala dongusel" saymak yanlis pozitif olurdu."""
+    found: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module in module_names:
+                found.add(node.module)
+            else:
+                for mn in module_names:
+                    if node.module == mn or node.module.startswith(mn + "."):
+                        found.add(mn)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in module_names:
+                    found.add(alias.name)
+                else:
+                    for mn in module_names:
+                        if alias.name == mn or alias.name.startswith(mn + "."):
+                            found.add(mn)
+    return found
+
+
+def _detect_circular_imports(file_codes: dict[str, str]) -> "dict[str, list[dict]] | None":
+    """Projenin KENDI dosyalari arasinda, modul YUKLENIRKEN (import zamaninda)
+    olusan bir dongusel import olup olmadigini AST tabanli bir bagimlilik
+    grafigi kurup tespit eder (Yama 20).
+
+    GERCEK MOTIVASYON: 12. canli JARVIS testinde (WikipediaScraper,
+    2026-09-24) reaktif duzeltici, "database.db guncellenmedi" sorununu
+    cozmeye calisirken core/database.py'nin KENDI '__main__' bloguna
+    `from main import WikipediaScraperApp` + `app = WikipediaScraperApp(...)`
+    ekledi - main.py de zaten `from core.database import save_data`
+    yaptigi icin bu, modul-seviyesinde GERCEK bir dongusel import olusturdu
+    (database.py'nin __main__ blogu hiçbir zaman calistirilmasa bile, TEK
+    BASINA modul-seviyesi 'from main import ...' satiri, main.py import
+    edilirken ANINDA cikmeza yol aciyor). Python bunu "cannot import name
+    'X' from partially initialized module 'Y' (most likely due to a
+    circular import)" seklinde bildiriyor - ama _detect_import_name_mismatch
+    (Yama 10) SADECE "from 'Y'" (dogrudan tek tirnak) desenini taniyordu,
+    "from partially initialized module 'Y'" (araya giren ek metin) UYUŞMUYOR
+    - bu yuzden reaktif duzeltici 2 tam deneme (4 ve 5) boyunca HANGI
+    dosyanin gercekten sorumlu oldugunu (core/database.py) HICBIR ZAMAN
+    ogrenemedi, ayni cokme birebir tekrarlandi.
+
+    Bu fonksiyon, hata metninin TAM ifadesine bagli kalmadan (daha saglam),
+    projenin GERCEK mevcut halini dogrudan tarayarak calisir."""
+    module_to_file = {_project_module_name(fp): fp for fp in file_codes}
+    module_names = set(module_to_file)
+
+    graph: dict[str, set[str]] = {}
+    for fp, code in file_codes.items():
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            continue
+        mod = _project_module_name(fp)
+        graph[mod] = _top_level_local_imports(tree, module_names) - {mod}
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    cycle_found: list[str] | None = None
+
+    def dfs(node: str, path: list[str]) -> bool:
+        nonlocal cycle_found
+        visiting.add(node)
+        path.append(node)
+        for nxt in graph.get(node, ()):
+            if nxt in visiting:
+                idx = path.index(nxt)
+                cycle_found = path[idx:] + [nxt]
+                return True
+            if nxt not in visited and dfs(nxt, path):
+                return True
+        path.pop()
+        visiting.discard(node)
+        visited.add(node)
+        return False
+
+    for mod in sorted(graph):
+        if mod not in visited and dfs(mod, []):
+            break
+
+    if not cycle_found:
+        return None
+
+    cycle_files = [module_to_file[m] for m in cycle_found if m in module_to_file]
+    chain_desc = " -> ".join(cycle_files)
+
+    issues: dict[str, list[dict]] = {}
+    for fp in dict.fromkeys(cycle_files):
+        issues.setdefault(fp, []).append({
+            "code": "CIRCULAR-IMPORT",
+            "message": (
+                f"Module-level circular import detected: {chain_desc}. "
+                "At least one of these top-level 'import'/'from ... import "
+                "...' statements executes while the other module is still "
+                "in the middle of being loaded, which will crash with "
+                "'cannot import name ... from partially initialized "
+                "module ...'. Fix by either (a) moving one of the "
+                "offending imports to be LOCAL to the specific function/ "
+                "method that actually needs it (a lazy import inside the "
+                "function body — this is the standard, safe fix and does "
+                "NOT run at module-load time), or (b) moving the shared "
+                "piece both files need into a third, lower-level file that "
+                "neither of the cycle's files needs to import from the "
+                "other for. Do not simply delete the functionality."
+            ),
+            "line": 1,
+            "col": 0,
+        })
+    return issues
+
+
 def _detect_import_name_mismatch(error_output: str, file_codes: dict[str, str]) -> "dict | None":
     """"cannot import name 'X' from 'Y'" seklindeki bir ImportError'i,
     projenin GERCEK dosyalariyla eslestirip somut, eyleme-donusturulebilir
@@ -2012,6 +2141,19 @@ def _fix_files(
         if error_type == "import_error" else None
     )
 
+    # DUZELTME (Yama 20, 12. canli WikipediaScraper testi): import_mismatch
+    # (yukarida) SADECE "cannot import name 'X' from 'Y'" (dogrudan tek
+    # tirnak) desenini yakalar - Python'un dongusel-import hatasindaki asil
+    # metin ("... from partially initialized module 'Y' (most likely due
+    # to a circular import)") bu regex ile UYUSMAZ, bu yuzden bu durumda
+    # import_mismatch hep None kalir. _detect_circular_imports ise hata
+    # metnine hic bakmadan, projenin GERCEK GUNCEL haline (file_codes)
+    # dogrudan AST ile bakar - daha saglam ve tam da bu sinifi yakalar.
+    circular_import = (
+        _detect_circular_imports(file_codes)
+        if error_type in ("import_error", "local_import_error") else None
+    )
+
     files_to_fix: list[str] = []
 
     # DUZELTME (Yama 14): proaktif ruff bulgulari icin - error_output bir
@@ -2083,6 +2225,14 @@ def _fix_files(
         # baglaminda 1500 karaktere kirpilmis halde gorunmesin.
         files_to_fix.append(import_mismatch["target_path"])
 
+    if circular_import:
+        # Yama 20: dongudeki TUM dosyalar (sadece error_file/entry_point
+        # degil) kendi ayri duzeltme denemesini alsin - dongu ancak
+        # dongudeki dosyalardan EN AZ BIRI degistirilirse kirilabilir.
+        for fp in circular_import:
+            if fp not in files_to_fix:
+                files_to_fix.append(fp)
+
     updated_codes: dict[str, str] = {}
 
     for fix_path in files_to_fix:
@@ -2116,6 +2266,25 @@ def _fix_files(
                 f"expected behavior. Pick exactly one of these two fixes — do not leave "
                 f"the same mismatched name in place, and do not fix it in both files "
                 f"(that would just create a new, different mismatch)."
+            )
+
+        circular_import_note = ""
+        if circular_import and fix_path in circular_import:
+            chain_desc = " -> ".join(circular_import.keys())
+            circular_import_note = (
+                f"\n\nCIRCULAR IMPORT DETECTED (this is very likely the real "
+                f"bug): {chain_desc} — these project files import each other "
+                f"at MODULE LOAD TIME, which crashes with \"cannot import "
+                f"name ... from partially initialized module ...\". Fix by "
+                f"moving the import that this specific file ({fix_path}) "
+                f"doesn't strictly need at load time to be LOCAL to the "
+                f"function/method that actually uses it (import it inside "
+                f"that function body instead of at the top of the file), or "
+                f"remove it entirely if it was added unnecessarily (for "
+                f"example, a file should almost never import and launch the "
+                f"application's own entry point from its own __main__ "
+                f"block — that responsibility belongs to the entry point "
+                f"alone)."
             )
 
         lint_issues_note = ""
@@ -2166,6 +2335,7 @@ Error type: {error_type}
 Error output:
 {error_output[:2500]}
 {import_mismatch_note}
+{circular_import_note}
 {lint_issues_note}
 {web_context}
 Current (broken) code:
@@ -2347,6 +2517,16 @@ def _build_project(
     # analiz hem bu davranissal sorun cozdurulebiliyor.
     gui_trigger_issues = _proactively_detect_gui_manual_only_triggers(file_codes) or {}
     for _fp, _issues in gui_trigger_issues.items():
+        lint_issues.setdefault(_fp, []).extend(_issues)
+
+    # DUZELTME (Yama 20): dongusel import tespiti - bkz. _detect_circular_imports
+    # docstring'i. AYNI birlesik {dosya: [bulgu,...]} sekli, bu yuzden ruff ve
+    # GUI-tetikleyici bulgularinin YANINA eklenip TEK bir _fix_files
+    # cagrisinda birlikte cozdurulebiliyor. Bu, dongu DAHA ILK yazimda
+    # olustuysa bile (12. testte oldugu gibi bir REAKTIF duzeltme sirasinda
+    # DEGIL) ilk calistirma denemesi hic harcanmadan yakalanmasini saglar.
+    circular_import_issues = _detect_circular_imports(file_codes) or {}
+    for _fp, _issues in circular_import_issues.items():
         lint_issues.setdefault(_fp, []).extend(_issues)
 
     if lint_issues:
