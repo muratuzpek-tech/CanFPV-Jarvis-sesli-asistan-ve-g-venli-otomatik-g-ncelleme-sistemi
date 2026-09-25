@@ -1,31 +1,32 @@
-# Ücretsiz yerel Dev Agent sağlayıcıları
+# Local dev-agent providers
 
-Jarvis'e iki opsiyonel yerel sağlayıcı eklendi:
+This branch adds an optional provider interface for free local coding agents.
+The supported providers are:
 
-- `ollama`: Varsayılan sağlayıcı; `127.0.0.1:11434` üzerinden çalışır.
-- `open-interpreter`: Sadece bilgisayara ayrıca kurulmuşsa ve açıkça seçilmişse kullanılır.
+- `ollama` (default), using `qwen2.5-coder:7b`.
+- `open-interpreter`, only when its CLI is installed and explicitly selected.
 
-## Yapılandırma
+Configure on Windows PowerShell:
 
 ```powershell
 $env:JARVIS_DEV_AGENT_PROVIDERS = "ollama,open-interpreter"
 $env:JARVIS_OLLAMA_MODEL = "qwen2.5-coder:7b"
+$env:JARVIS_WORKSPACE = "$env:USERPROFILE\Desktop\JarvisProjects"
 ```
 
-Ollama için örnek:
+Install and download the local model separately:
 
 ```powershell
 ollama pull qwen2.5-coder:7b
+pip install open-interpreter
 ```
 
-Open Interpreter opsiyoneldir; kurulumu yapılmadıysa fallback zinciri Ollama'yı
-kullanmaya devam eder.
+The provider layer only returns untrusted text. It does not apply patches,
+write `src/jarvis`, install dependencies, or execute generated code. The
+existing `dev_agent` confirmation, workspace, validation, and review flow must
+remain the only path that applies changes.
 
-## Güvenlik sınırı
-
-`dev_agent_providers.py` yalnızca metin üretir. Dönen kodu otomatik uygulamaz,
-`src/jarvis` içine yazmaz ve paket kurmaz. Patch uygulama, test çalıştırma ve
-kullanıcı onayı mevcut `dev_agent` akışında kalmalıdır. Her provider izole
-workspace ile çağrılmalıdır.
-
-Bu değişiklik hiçbir dosyayı silmez.
+Claude Code, Continue, and OpenDevin are not included as fake adapters because
+they have different CLI/API contracts and may require separate credentials or
+runtime services. They can be added later behind this same interface after a
+specific local installation contract is selected.
