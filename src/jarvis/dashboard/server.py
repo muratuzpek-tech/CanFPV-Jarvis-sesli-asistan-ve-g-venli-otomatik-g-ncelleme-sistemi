@@ -713,10 +713,10 @@ class DashboardServer:
 
         def _safe_filename(raw: str) -> str | None:
             name = str(raw).strip()
-            # Only allow plain filenames (no path separators or traversal tokens).
+            # Clients may submit a full/relative path (e.g. "../nested.txt");
+            # only the final path component is ever used as the stored name.
+            name = os.path.basename(name.replace("\\", "/"))
             if not name or name in {".", ".."}:
-                return None
-            if "/" in name or "\\" in name:
                 return None
             if not re.fullmatch(r"[A-Za-z0-9._ -]{1,255}", name):
                 return None
@@ -737,6 +737,8 @@ class DashboardServer:
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
                 safe = _safe_filename(file.filename or "upload")
+                if safe is None:
+                    return JSONResponse({"error": "Invalid file name"}, status_code=400)
                 dest = _upload_path(safe)
                 if dest is None:
                     return JSONResponse({"error": "Invalid file name"}, status_code=400)

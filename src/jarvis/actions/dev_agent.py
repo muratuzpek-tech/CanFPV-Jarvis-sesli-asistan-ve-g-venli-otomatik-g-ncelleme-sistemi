@@ -2583,6 +2583,7 @@ def _build_project(
         + (f": {o.get('description', '')}" if isinstance(o, dict) and o.get("description") else "")
         for o in expected_outputs if o
     )
+    gui_task = bool(re.search(r"\b(?:tkinter|tk\.)\b", description, re.IGNORECASE))
 
     # Aynı proje adıyla yapılan tekrar denemelerde eski database.db/report
     # dosyası yeni çalışmanın sonucu gibi görünmemeli. Yalnızca planner'ın
@@ -2689,27 +2690,6 @@ def _build_project(
     for _fp, _issues in gui_trigger_issues.items():
         lint_issues.setdefault(_fp, []).extend(_issues)
 
-    # GUI projeleri otomatik doğrulanabilir bir yol taşımak zorunda. Sadece
-    # butonlu bir Tkinter uygulaması dev-agent tarafından başlatıldığında
-    # pencere açık kalır, fakat scraping/database işi hiç başlamayabilir.
-    # Önceki detector sınıf/command kalıbını yakalayamadığında bu genel
-    # sözleşme kontrolü yine de writer/fixer'a açık talimat verir.
-    all_generated_source = "\n".join(file_codes.values())
-    gui_task = bool(re.search(r"\b(?:tkinter|tk\.)\b", description, re.IGNORECASE))
-    if gui_task and expected_outputs and "--headless-test" not in all_generated_source:
-        lint_issues.setdefault(entry_point, []).append({
-            "code": "GUI-HEADLESS-VERIFICATION-MISSING",
-            "message": (
-                "This GUI project has concrete expected outputs but no --headless-test "
-                "mode. Add argparse --headless-test that runs the complete workflow "
-                "without opening Tk/mainloop, prints processed/successful/failed/"
-                "database_records and prints SUCCESS only when all URLs succeed. "
-                "Keep the interactive GUI for normal use."
-            ),
-            "line": 0,
-            "col": 0,
-        })
-
     # DUZELTME (Yama 20): dongusel import tespiti - bkz. _detect_circular_imports
     # docstring'i. AYNI birlesik {dosya: [bulgu,...]} sekli, bu yuzden ruff ve
     # GUI-tetikleyici bulgularinin YANINA eklenip TEK bir _fix_files
@@ -2741,11 +2721,75 @@ def _build_project(
         except RateLimitError:
             log("Rate limit - ruff proaktif düzeltmesi atlandı, normal çalıştırma denemesine geçiliyor.")
 
-    # Model headless modu eklediyse GUI'yi değil, otomatik doğrulama yolunu
-    # çalıştır. Böylece root.mainloop() timeout üretmez ve database çıktısı
-    # gerçekten üretim sırasında doğrulanabilir.
-    entry_source = file_codes.get(entry_point, "")
-    if gui_task and "--headless-test" in entry_source and "--headless-test" not in run_command:
+    # GUI projeleri otomatik doğrulanabilir bir yol taşımak zorunda. Sadece
+    # butonlu bir Tkinter uygulaması dev-agent tarafından başlatıldığında
+    # pencere açık kalır, fakat scraping/database işi hiç başlamayabilir. Bu
+    # kontrol, yukarıdaki proaktif/statik düzeltmeler (ruff, GUI-tetikleyici,
+    # dongusel import) BİTTİKTEN SONRA, dosyaların NİHAİ halinde çalışır -
+    # boylece o duzeltmelerin ekledigi/degistirdigi kod da hesaba katilir.
+    def _headless_mode_present() -> bool:
+        return "--headless-test" in "\n".join(file_codes.values())
+
+    headless_unverifiable = False
+    if gui_task and expected_outputs and not _headless_mode_present():
+        log("GUI projesi somut beklenen çıktılara sahip ama hiçbir dosyada --headless-test modu yok; odaklı bir düzeltme isteniyor...")
+        try:
+            headless_fixed = _fix_files(
+                error_output=(
+                    "This GUI project has concrete expected outputs but NO --headless-test "
+                    "mode exists anywhere in the generated source. Add a complete argparse "
+                    "--headless-test mode that performs the FULL real workflow (the same work "
+                    "the GUI button triggers) WITHOUT creating a Tk root window or calling "
+                    "mainloop(), and prints measurable completion/results (e.g. processed/"
+                    "successful/failed/database_records) so an automated harness can verify "
+                    "success. Keep the interactive GUI unchanged for normal use."
+                ),
+                project_description=description,
+                all_files=files,
+                file_codes=file_codes,
+                language=language,
+                project_dir=project_dir,
+                entry_point=entry_point,
+                shared_contracts=shared_contracts_text,
+                expected_outputs=expected_outputs_text,
+                known_error_type="lint_error",
+                lint_issues={entry_point: [{
+                    "code": "GUI-HEADLESS-VERIFICATION-MISSING",
+                    "message": (
+                        "This GUI project has concrete expected outputs but no "
+                        "--headless-test mode. Add argparse --headless-test that runs the "
+                        "complete workflow without opening Tk/mainloop, prints processed/"
+                        "successful/failed/database_records and prints SUCCESS only when "
+                        "everything succeeds. Keep the interactive GUI for normal use."
+                    ),
+                    "line": 0,
+                    "col": 0,
+                }]},
+            )
+            if headless_fixed:
+                file_codes.update(headless_fixed)
+        except RateLimitError:
+            log("Rate limit - headless doğrulama modu düzeltmesi atlandı.")
+        except Exception as e:
+            log(f"Headless doğrulama düzeltmesi başarısız: {e}")
+
+        if not _headless_mode_present():
+            headless_unverifiable = True
+            log("⚠️ Odaklı düzeltmeden sonra da --headless-test modu üretilemedi; GUI sahte bir doğrulama gibi ASLA başlatılmayacak.")
+
+    if headless_unverifiable:
+        msg = (
+            f"'{proj_name}' projesi için dosyalar {project_dir} içine kaydedildi, ancak "
+            f"otomatik doğrulama ATLANDI, efendim: bu GUI projesi somut beklenen çıktılara "
+            f"sahip ama modelden istenen --headless-test modu üretilemedi (kota sınırı da "
+            f"olabilir). GUI'yi sahte bir doğrulama denemesi olarak başlatmadım - projeyi "
+            f"elle VSCode'dan kontrol edin."
+        )
+        if speak:
+            speak(msg)
+        return msg
+
+    if gui_task and _headless_mode_present() and "--headless-test" not in run_command:
         run_command = f"{run_command} --headless-test"
         log(f"Headless doğrulama komutu seçildi: {run_command}")
 
