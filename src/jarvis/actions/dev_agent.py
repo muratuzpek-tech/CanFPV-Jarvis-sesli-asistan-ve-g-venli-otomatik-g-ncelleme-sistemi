@@ -2742,7 +2742,19 @@ def _build_project(
                     "the GUI button triggers) WITHOUT creating a Tk root window or calling "
                     "mainloop(), and prints measurable completion/results (e.g. processed/"
                     "successful/failed/database_records) so an automated harness can verify "
-                    "success. Keep the interactive GUI unchanged for normal use."
+                    "success. CRITICAL: --headless-test must NEVER read its input from a live "
+                    "GUI widget (Entry.get(), Text.get(), StringVar, etc.); use deterministic "
+                    "sample/default input so the real workflow is exercised end to end. "
+                    "Shared worker/business-logic functions called by --headless-test must "
+                    "never construct, reference, or update Tk widgets or the Tk root (no "
+                    "Label(root, ...), widget.config(), root.update_idletasks(), or global "
+                    "root lookup). Refactor shared logic to perform the real work and return "
+                    "plain data; only the GUI callback wrapper may update widgets. Compute "
+                    "processed/successful/failed/database_records from actual return values "
+                    "or a database query, never hardcoded literals. Print FAILED when any "
+                    "expected condition is unmet; print SUCCESS only when the complete "
+                    "workflow and database verification succeed. Keep the interactive GUI "
+                    "unchanged for normal use."
                 ),
                 project_description=description,
                 all_files=files,
@@ -2760,7 +2772,15 @@ def _build_project(
                         "--headless-test mode. Add argparse --headless-test that runs the "
                         "complete workflow without opening Tk/mainloop, prints processed/"
                         "successful/failed/database_records and prints SUCCESS only when "
-                        "everything succeeds. Keep the interactive GUI for normal use."
+                        "everything succeeds. --headless-test must drive the real workflow "
+                        "with deterministic sample/default input, never by reading an empty "
+                        "GUI widget (Entry/Text/StringVar). Shared worker functions must "
+                        "never touch a Tk widget or the Tk root; refactor them to return "
+                        "plain data instead, and let only the GUI callback update widgets. "
+                        "The printed processed/successful/failed/database_records values "
+                        "must come from the real run or a database query, never hardcoded "
+                        "literals. Keep the interactive GUI and its Start button working "
+                        "normally."
                     ),
                     "line": 0,
                     "col": 0,
